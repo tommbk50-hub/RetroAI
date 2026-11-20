@@ -527,7 +527,7 @@ def _render_routes_html_from_results(res: dict, ord_validator: ORDRetrosynthesis
     header_html = f"""
     <div class="cf-strat-box">
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">
-        <div style="font-size:10px;font-weight:700;color:#0284c7;">TARGET · {str(res.get('search_algorithm', 'RETROSTAR')).upper()} · MODE: {rk_mode.upper()} ({len(routes)} ROUTES) · ORD INDEX: {ord_cnt:,} RXNS{pf_pill_html} · AI: {html.escape(used_model.upper())} ({html.escape(used_think.upper())}) · RAM: {ram_now} MB</div>
+        <div style="font-size:10px;font-weight:700;color:#0284c7;">TARGET · {html.escape(str(res.get('search_algorithm', 'RETROSTAR')).upper())} · MODE: {html.escape(rk_mode.upper())} ({len(routes)} ROUTES) · ORD INDEX: {ord_cnt:,} RXNS{pf_pill_html} · AI: {html.escape(used_model.upper())} ({html.escape(used_think.upper())}) · RAM: {ram_now} MB</div>
         <button class="cf-btn" style="padding:3px 9px;font-size:11px;" onclick="cfOpenAgentWithRoutes()">🤖 Discuss Routes in Chemist AI Agent</button>
       </div>
       <div style="font-size:13px;font-weight:600;margin:4px 0 6px 0;word-break:break-all;color:#0f172a;">{html.escape(strat.get('iupac_or_label', target))}</div>
@@ -1150,10 +1150,16 @@ async function cfFreeMemory() {{
   document.getElementById("cf-status").innerText = data.message;
 }}
 
+function cfEscapeHtml(text) {{
+  const span = document.createElement("span");
+  span.textContent = String(text ?? "");
+  return span.innerHTML;
+}}
+
 function cfRenderDescriptors(d) {{
   const el = document.getElementById("cf-desc-bar");
   if (!d || d.error) {{
-    el.innerHTML = `<div style="grid-column:span 4;color:#dc2626;">⚠️ ${{d ? d.error : 'Invalid structure'}}</div>`;
+    el.innerHTML = `<div style="grid-column:span 4;color:#dc2626;">⚠️ ${{cfEscapeHtml(d ? d.error : 'Invalid structure')}}</div>`;
     return;
   }}
   const ro5 = d.ro5_pass
@@ -1362,13 +1368,13 @@ async function cfRunSynthesis() {{
     const res = await google.colab.kernel.invokeFunction("chemforge.run_synthesis", [smi, JSON.stringify(cfg)], {{}});
     clearInterval(progTimer);
     const data = res.data["application/json"];
-    out.innerHTML = data.error ? `<div style="color:#dc2626;font-weight:600;">⚠️ ${{data.error}}</div>` : data.html;
+    out.innerHTML = data.error ? `<div style="color:#dc2626;font-weight:600;">⚠️ ${{cfEscapeHtml(data.error)}}</div>` : data.html;
     cfUpdateRamBadge(data.ram_mb);
     cfUpdateOrdBadge(data.ord_index_size, data.ord_prefetch);
     cfRefreshAgentStatus();
   }} catch (err) {{
     clearInterval(progTimer);
-    out.innerHTML = `<div style="color:#dc2626;font-weight:600;">⚠️ Kernel error: ${{err}}</div>`;
+    out.innerHTML = `<div style="color:#dc2626;font-weight:600;">⚠️ Kernel error: ${{cfEscapeHtml(err)}}</div>`;
   }} finally {{
     if (planBtn) planBtn.disabled = false;
     if (reclassBtn) reclassBtn.disabled = false;
@@ -1401,7 +1407,7 @@ async function cfReclassifyRoutes() {{
     const banner = document.getElementById("cf-reclass-banner");
     if (banner) banner.remove();
     if (data.error) {{
-      out.insertAdjacentHTML("afterbegin", `<div style="color:#dc2626;font-weight:600;margin-bottom:8px;">⚠️ ${{data.error}}</div>`);
+      out.insertAdjacentHTML("afterbegin", `<div style="color:#dc2626;font-weight:600;margin-bottom:8px;">⚠️ ${{cfEscapeHtml(data.error)}}</div>`);
     }} else {{
       out.innerHTML = data.html;
     }}
@@ -1411,7 +1417,7 @@ async function cfReclassifyRoutes() {{
   }} catch (err) {{
     const banner = document.getElementById("cf-reclass-banner");
     if (banner) banner.remove();
-    out.insertAdjacentHTML("afterbegin", `<div style="color:#dc2626;font-weight:600;margin-bottom:8px;">⚠️ Kernel error: ${{err}}</div>`);
+    out.insertAdjacentHTML("afterbegin", `<div style="color:#dc2626;font-weight:600;margin-bottom:8px;">⚠️ Kernel error: ${{cfEscapeHtml(err)}}</div>`);
   }} finally {{
     if (reclassBtn) reclassBtn.disabled = false;
     if (planBtn) planBtn.disabled = false;
@@ -1428,7 +1434,7 @@ async function cfSendAgentMsg() {{
   const smi = document.getElementById("cf-smiles-box").value.trim();
   const selModel = document.getElementById("cf-global-model").value;
   const selThinking = document.getElementById("cf-global-thinking").value;
-  log.insertAdjacentHTML("beforeend", `<div class="cf-msg-user">${{msg.replace(/</g, "&lt;")}}</div>`);
+  log.insertAdjacentHTML("beforeend", `<div class="cf-msg-user">${{cfEscapeHtml(msg)}}</div>`);
   const waitId = "cf-wait-" + Date.now();
   log.insertAdjacentHTML("beforeend", `<div id="${{waitId}}" class="cf-msg-bot">⏳ <b>Chemist AI Agent</b> (<code>${{selModel}}</code> · <code>${{selThinking}}</code>) is analyzing ORD-validated routes &amp; running tools...</div>`);
   log.scrollTop = log.scrollHeight;
@@ -1445,7 +1451,7 @@ async function cfSendAgentMsg() {{
     cfRefreshAgentStatus();
   }} catch (err) {{
     const waitEl = document.getElementById(waitId);
-    if (waitEl) waitEl.outerHTML = `<div class="cf-msg-bot" style="color:#dc2626;">⚠️ Error: ${{err}}</div>`;
+    if (waitEl) waitEl.outerHTML = `<div class="cf-msg-bot" style="color:#dc2626;">⚠️ Error: ${{cfEscapeHtml(err)}}</div>`;
   }} finally {{
     if (sendBtn) sendBtn.disabled = false;
     log.scrollTop = log.scrollHeight;
@@ -1478,7 +1484,7 @@ async function cfRunReaction() {{
   out.innerHTML = `⏳ <b style='color:#0284c7;'>Prefetching live online ORD precedents &amp; analyzing with ${{selModel}} (${{selThinking}})...</b>`;
   const res = await google.colab.kernel.invokeFunction("chemforge.analyze_reaction", [smi, selModel, selThinking], {{}});
   const data = res.data["application/json"];
-  out.innerHTML = data.error ? `<div style="color:#dc2626;">⚠️ ${{data.error}}</div>` : data.html;
+  out.innerHTML = data.error ? `<div style="color:#dc2626;">⚠️ ${{cfEscapeHtml(data.error)}}</div>` : data.html;
 }}
 
 async function cfRunQA() {{
@@ -1515,6 +1521,15 @@ async function cfRegisterStock() {{
 
     del ketcher_b64_html
     del unified_workbench_html
+
+
+def _format_agent_reply(reply_text: str) -> str:
+    """Keep the requested formatting but do not execute model-generated markup."""
+    formatted = html.escape(reply_text)
+    for tag in ("b", "ul", "li", "code", "p"):
+        formatted = formatted.replace(f"&lt;{tag}&gt;", f"<{tag}>")
+        formatted = formatted.replace(f"&lt;/{tag}&gt;", f"</{tag}>")
+    return formatted
 
 
 class _Workbench:
@@ -1859,7 +1874,7 @@ class _Workbench:
         routes_ctx = json.dumps(self.state.latest_retro_results.get("routes", [])[:3])
         client = get_gemini_client()
         if client is None:
-            return IPython.display.JSON({"html": f"<div class='cf-route-card'>Add <code>KDD_GEMINI_API_KEY</code> in Colab Secrets to enable Gemini Q&amp;A. RDKit descriptors: <code>{json.dumps(desc)}</code></div>"})
+            return IPython.display.JSON({"html": f"<div class='cf-route-card'>Add <code>KDD_GEMINI_API_KEY</code> in Colab Secrets to enable Gemini Q&amp;A. RDKit descriptors: <code>{html.escape(json.dumps(desc))}</code></div>"})
         try:
             resp, used_m, used_t = call_gemini_with_config(
                 contents=f"Active SMILES: {s}\nDescriptors: {json.dumps(desc)}\nTop AiZynthFinder + ORD Validated Routes: {routes_ctx}\nQuestion: {q}",
@@ -2050,7 +2065,7 @@ class _Workbench:
             )
             reply_text = resp.text or "Completed tool execution."
         except Exception as e:
-            reply_text = f"Agent error: {html.escape(str(e))}"
+            reply_text = f"Agent error: {e}"
 
         history.append({"role": "user", "text": msg})
         history.append({"role": "assistant", "text": reply_text[:1500]})
@@ -2059,7 +2074,7 @@ class _Workbench:
 
         ram_mb = cleanup_aizynth_memory(self.finder, trim_ipython_history=True, state=self.state)
         badge_html = f"<div style='font-size:10px;font-weight:700;color:#0284c7;margin-bottom:4px;'>🤖 {html.escape(used_m)} · Thinking: {html.escape(used_t.upper())}</div>"
-        combined_html = f"<div style='line-height:1.5;font-size:12px;'>{badge_html}{reply_text}{''.join(tool_artifacts_html)}</div>"
+        combined_html = f"<div style='line-height:1.5;font-size:12px;'>{badge_html}{_format_agent_reply(reply_text)}{''.join(tool_artifacts_html)}</div>"
         routes_now = self.state.latest_retro_results.get("routes", [])
         return IPython.display.JSON({
             "reply_html": combined_html,
