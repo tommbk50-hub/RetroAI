@@ -4,6 +4,9 @@ RetroAI combines AiZynthFinder route search, RDKit analytics, Open Reaction Data
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/tommbk50-hub/RetroAI/blob/main/Retrosynthesis_Agent.ipynb)
 
+<img width="1103" height="625" alt="image" src="https://github.com/user-attachments/assets/6529d147-a8db-49fc-9b84-ecef22a24232" />
+
+
 Run both notebook cells to install the package, download the USPTO models and ZINC stock, and launch the Ketcher workbench. Set `KDD_GEMINI_API_KEY` in Colab Secrets for Gemini features. For headless use, set it as an environment variable instead. `HF_TOKEN` is optional.
 
 ## Local development
