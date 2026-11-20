@@ -126,7 +126,7 @@ def run_retrosynthesis_pipeline(
         finder.tree_search()
         finder.build_routes()
         node_templates = {}
-        all_fwd_smiles = _harvest_uspto_templates_from_finder(finder, node_templates)
+        all_fwd_smiles = _harvest_uspto_templates_from_finder(finder, node_templates, state=state)
         raw_routes = list(finder.routes)
         route_steps = [_flatten_reaction_tree(r["reaction_tree"], node_templates) for r in raw_routes]
         all_steps = [step for steps in route_steps for step in steps]

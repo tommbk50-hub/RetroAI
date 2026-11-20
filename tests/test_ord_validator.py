@@ -1,8 +1,11 @@
 import gzip
+from types import SimpleNamespace
 
 import pytest
 
 from retroai.ord import fingerprints, validator as ord_validator
+from retroai.core.state import WorkbenchState
+from retroai.engine import aizynth, pipeline
 from ord_schema.proto import dataset_pb2, reaction_pb2
 
 
@@ -85,3 +88,36 @@ def test_validator_indexes_a_local_ord_shard_and_filters_precedents(tmp_path, mo
     assert report["matched_smarts_label"] == "Tier 1: Exact USPTO Template SMARTS"
     assert [hit["ord_id"] for hit in report["top_precedents"]] == ["ord-test-alcohol"]
     assert validator.score_route([OXIDATION], step_reports=[report])["ord_mean_yield_pct"] == 72.0
+
+
+def test_pipeline_shares_template_and_lab_stock_state(tmp_path, monkeypatch):
+    node = SimpleNamespace(
+        reaction_smiles=lambda: "CC=O>>CCO",
+        metadata={"retro_template": RETRO_TEMPLATE, "classification": "Alcohol oxidation"},
+    )
+    tree = SimpleNamespace(
+        reactions=lambda: [node],
+        child_reactions=lambda node: [],
+        leafs=lambda: [SimpleNamespace(smiles="CCO")],
+        in_stock=lambda leaf: False,
+        is_solved=False,
+    )
+    finder = SimpleNamespace(config=SimpleNamespace(search=SimpleNamespace()), expansion_policy={})
+    finder.tree_search = lambda: setattr(finder, "tree", object())
+    finder.build_routes = lambda: setattr(finder, "routes", [{"reaction_tree": tree, "score": {"state score": 0.8}}])
+    monkeypatch.setattr(pipeline, "get_finder", lambda: finder)
+
+    validator = ord_validator.ORDRetrosynthesisValidator(tmp_path / "ord.duckdb")
+    state = WorkbenchState()
+    state.retro_search_params["validate_ord"] = False
+    aizynth.register_custom_lab_stock(["CCO"], state=state)
+
+    results = pipeline.run_retrosynthesis_pipeline("CC=O", use_gemini=False, state=state, ord_validator=validator)
+
+    assert results is state.latest_retro_results
+    assert results["is_solved"]
+    assert state.step_templates[OXIDATION]["retro_template"] == RETRO_TEMPLATE
+    assert results["routes"][0]["steps"][0]["reaction_name"] == "Alcohol oxidation"
+    assert results["routes"][0]["starting_materials"]["precursors"][0]["source"] == "Lab Stock"
+    assert finder.tree is None
+    assert finder.routes == []
