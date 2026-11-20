@@ -15,7 +15,12 @@ from rdkit.Chem.MolStandardize import rdMolStandardize
 
 from retroai.core.chem_utils import _canonical_molecule_smiles, _extract_primary_smiles
 
-from .fingerprints import compute_drfp_bytes, compute_folded_rxn_fp, compute_rdkit_internal_delta_fg
+from .fingerprints import (
+    compute_drfp_bytes,
+    compute_folded_rxn_fp,
+    compute_rdkit_internal_delta_fg,
+    compute_rxn_center_diff_fp,
+)
 
 
 def _ord_enum_name(msg, field_name: str) -> str:
@@ -450,6 +455,8 @@ def parse_ord_reaction_protobuf(rxn, admit=None) -> Optional[dict]:
     if fp_bytes is None:
         return None
     drfp_bytes = compute_drfp_bytes(clean_rxn_smi)
+    diff_fp = compute_rxn_center_diff_fp(clean_rxn_smi)
+    diff_fp_bytes = diff_fp.ToBinary() if diff_fp is not None else None
     consumed, formed, _ = compute_rdkit_internal_delta_fg(clean_rxn_smi)
     consumed_fgs = sorted(consumed.elements()) if hasattr(consumed, "elements") else sorted(consumed)
     formed_fgs = sorted(formed.elements()) if hasattr(formed, "elements") else sorted(formed)
@@ -471,6 +478,7 @@ def parse_ord_reaction_protobuf(rxn, admit=None) -> Optional[dict]:
         "reference": ref,
         "fp_bytes": fp_bytes,
         "drfp_bytes": drfp_bytes,
+        "diff_fp_bytes": diff_fp_bytes,
         "consumed_fgs": json.dumps(consumed_fgs),
         "formed_fgs": json.dumps(formed_fgs),
         "procedure_details": rxn.notes.procedure_details,

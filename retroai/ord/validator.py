@@ -173,9 +173,10 @@ def _fetch_step_ord_records_worker(
 
     elapsed = time.time() - t0
     if not raw_protos and core_product and elapsed < (per_step_timeout - 1.0):
+        fallback_threshold = max(0.30, similarity_threshold - 0.10)
         tier2_params = [
             ("component", f"{core_product};output;similarity"),
-            ("similarity", str(max(0.32, similarity_threshold - 0.08))),
+            ("similarity", f"{fallback_threshold:.2f}"),
             ("use_stereochemistry", "false"),
             ("limit", str(limit)),
         ]
@@ -190,8 +191,8 @@ def _fetch_step_ord_records_worker(
 
 class ORDRetrosynthesisValidator:
     """
-    Validates proposed retrosynthesis steps against ORD Parquet shards & live online ORD queries:
-      1. SMARTS/ΔFG admission, then structural/difference fingerprint ranking and yield tie-breaks
+    Validates proposed retrosynthesis steps against local ORD shards and live online ORD queries:
+      1. Exact connectivity/DRFP retrieval, then SMARTS/ΔFG chemical admission and ranking
       2. Empirical Feasibility & 'Negative Data' Filtering (Yield stats, HTE <15% failure rate, ORD side-products)
       3. Forward Condition Grounding (Consensus catalyst, reagent, solvent, temperature, atmosphere, DOI)
       4. Route-Level Composite Scoring (ORD Empirical Confidence Score)
@@ -232,6 +233,7 @@ class ORDRetrosynthesisValidator:
             con.execute(f"ALTER TABLE ord_reactions ADD COLUMN IF NOT EXISTS {column} VARCHAR DEFAULT ''")
         con.execute("ALTER TABLE ord_reactions ADD COLUMN IF NOT EXISTS duration_h DOUBLE")
         con.execute("ALTER TABLE ord_reactions ADD COLUMN IF NOT EXISTS drfp_bytes BLOB")
+        con.execute("ALTER TABLE ord_reactions ADD COLUMN IF NOT EXISTS diff_fp_bytes BLOB")
         con.execute("ALTER TABLE ord_reactions ADD COLUMN IF NOT EXISTS consumed_fgs VARCHAR DEFAULT '[]'")
         con.execute("ALTER TABLE ord_reactions ADD COLUMN IF NOT EXISTS formed_fgs VARCHAR DEFAULT '[]'")
         con.execute("CREATE INDEX IF NOT EXISTS idx_ord_conn ON ord_reactions (prod_connectivity)")
@@ -256,7 +258,8 @@ class ORDRetrosynthesisValidator:
                 SELECT ord_id, rxn_smiles
                 FROM ord_reactions
                 WHERE ord_id > ? AND (
-                    drfp_bytes IS NULL OR consumed_fgs IS NULL OR formed_fgs IS NULL
+                    drfp_bytes IS NULL OR diff_fp_bytes IS NULL
+                    OR consumed_fgs IS NULL OR formed_fgs IS NULL
                 )
                 ORDER BY ord_id
                 LIMIT 256
@@ -266,17 +269,19 @@ class ORDRetrosynthesisValidator:
             if not rows:
                 return
             for ord_id, rxn_smiles in rows:
+                diff_fp = compute_rxn_center_diff_fp(rxn_smiles or "")
                 consumed, formed, _ = compute_rdkit_internal_delta_fg(rxn_smiles or "")
                 consumed_fgs = sorted(consumed.elements()) if hasattr(consumed, "elements") else sorted(consumed)
                 formed_fgs = sorted(formed.elements()) if hasattr(formed, "elements") else sorted(formed)
                 con.execute(
                     """
                     UPDATE ord_reactions
-                    SET drfp_bytes = ?, consumed_fgs = ?, formed_fgs = ?
+                    SET drfp_bytes = ?, diff_fp_bytes = ?, consumed_fgs = ?, formed_fgs = ?
                     WHERE ord_id = ?
                     """,
-                    [compute_drfp_bytes(rxn_smiles or ""), json.dumps(consumed_fgs),
-                     json.dumps(formed_fgs), ord_id],
+                    [compute_drfp_bytes(rxn_smiles or ""),
+                     diff_fp.ToBinary() if diff_fp is not None else None,
+                     json.dumps(consumed_fgs), json.dumps(formed_fgs), ord_id],
                 )
             last_ord_id = rows[-1][0]
 
@@ -423,7 +428,7 @@ class ORDRetrosynthesisValidator:
     def sync_huggingface_parquet_shards(self, max_shards: int = 3, max_reactions_per_shard: int = 5000,
                                         custom_smarts_list: Optional[List[str]] = None,
                                         forward_smiles_list: Optional[List[str]] = None, *, route_steps=None) -> dict:
-        """Index bounded ORD shards, filtering to the active steps when available."""
+        """Index bounded ORD protobuf shards, filtering to the active steps when available."""
         gates = [(build_progressive_reaction_smarts(smi, template, mapped), compute_rdkit_internal_delta_fg(smi))
                  for smi, template, mapped in _ord_gate_specs(forward_smiles_list, route_steps) if _parse_reaction_mols(smi)[0]]
         custom_smarts = tuple(sorted(set(custom_smarts_list or [])))
@@ -589,7 +594,14 @@ class ORDRetrosynthesisValidator:
                 if drfp_sim is None:
                     if q_diff is None:
                         q_diff = compute_rxn_center_diff_fp(s)
-                    c_diff = compute_rxn_center_diff_fp(rxn) if q_diff is not None else None
+                    c_diff = None
+                    if q_diff is not None and rec.get("diff_fp_bytes"):
+                        try:
+                            c_diff = DataStructs.UIntSparseIntVect(bytes(rec["diff_fp_bytes"]))
+                        except (TypeError, ValueError, RuntimeError):
+                            pass
+                    if q_diff is not None and c_diff is None:
+                        c_diff = compute_rxn_center_diff_fp(rxn)
                     drfp_sim = (
                         float(DataStructs.TanimotoSimilarity(q_diff, c_diff))
                         if c_diff is not None else 0.0
@@ -601,6 +613,7 @@ class ORDRetrosynthesisValidator:
                 rec["matched_smarts_label"] = label
                 rec.pop("fp_bytes", None)
                 rec.pop("drfp_bytes", None)
+                rec.pop("diff_fp_bytes", None)
                 analog_records.append(rec)
 
         analog_records.sort(key=lambda x: (-x["similarity"], -(x["yield_pct"] if x["yield_pct"] is not None else -1.0), x["ord_id"]))
@@ -665,7 +678,10 @@ class ORDRetrosynthesisValidator:
             "exact_product_hits": exact_hits,
             "smarts_matched_count": len(analog_records),
             "matched_smarts_label": matched_smarts_label,
-            "rdkit_delta_fg_signature": dict(zip(("consumed_fgs", "formed_fgs", "reactant_fgs"), map(sorted, delta))),
+            "rdkit_delta_fg_signature": dict(zip(
+                ("consumed_fgs", "formed_fgs", "reactant_fgs"),
+                (sorted(Counter(groups).elements()) for groups in delta),
+            )),
             "max_rxn_similarity": round(max_sim, 3),
             "mean_analog_yield_pct": mean_yield,
             "median_analog_yield_pct": median_yield,

@@ -1608,7 +1608,7 @@ class _Workbench:
 
 
     def _cb_sync_ord_shards(self, num_shards: int = 1):
-        """Streams ORD Parquet shards from Hugging Face into the DuckDB index and updates UI badge."""
+        """Streams ORD protobuf shards from Hugging Face into the DuckDB index and updates UI badge."""
         info = self.ord_validator.sync_huggingface_parquet_shards(
             max_shards=int(num_shards), route_steps=self.state.active_route_steps()
         )
