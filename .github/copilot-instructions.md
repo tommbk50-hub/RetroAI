@@ -14,5 +14,5 @@ Run `python -m pip install -e '.[test]'` and `python -m pytest` from the reposit
 Before finishing any task or opening a PR that adds, renames, moves, or deletes a file, notebook cell (`# @title`), core function, or UI component:
 1. Update the **Repository Structure & Landmarks** section of `.github/copilot-instructions.md` to reflect the exact current state.
 2. Remove references to deleted features or renamed functions so future agents do not waste tokens searching for them.
-3. Do **not** edit content inside `<!-- AUTO-MAP:START -->` and `<!-- AUTO-MAP:END -->` manually if the auto-mapper workflow is active; update the human-written architectural notes and "Do Not Touch" boundaries instead.
+3. Do **not** edit content inside `<!-- AUTO-MAP:START -->` and `<!-- AUTO-MAP:END -->` within the README.md manually if the auto-mapper workflow is active; update the human-written architectural notes and "Do Not Touch" boundaries instead.
 4. When a Pull Requested is merged, update the README.md file to briefly add a date-stamped description the new features were added, along with the issue link and PR link to reflect the cuurent state of the notebook. 
