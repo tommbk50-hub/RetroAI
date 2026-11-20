@@ -9,6 +9,21 @@ RetroAI combines AiZynthFinder route search, RDKit analytics, Open Reaction Data
 
 Run both notebook cells to install the package, download the USPTO models and ZINC stock, and launch the Ketcher workbench. Set `KDD_GEMINI_API_KEY` in Colab Secrets for Gemini features. For headless use, set it as an environment variable instead. `HF_TOKEN` is optional.
 
+## How it works?
+Retrosynthesis is planning backward: start with the molecule you want to make and look for simpler starting materials that could lead to it. RetroAI suggests several possible routes so you can compare them.
+### Plan a route
+1. **Choose a target.** Draw it in the Ketcher sketchpad, or enter a name, database ID, or SMILES (a text representation of a molecule) in the search box and click **Load**. You can also pick a built-in example.
+2. **Run the search.** In **Synthesis**, click **Plan Synthesis Route**. The defaults are enough for a first run. In the search settings, you can limit the number of steps or how long the search runs. Use **Lock Selected** to keep only routes that contain your selected fragment in an intermediate or starting material, or **Register Lab Stock** to count materials you already have.
+3. **Read the route cards.** **Solved** means all starting materials are listed in stock; **Partial** means some are missing. Open **Why might this fail?** to see flagged risks, and inspect individual steps for similar recorded reactions where available.
+### How routes are found and scored
+AiZynthFinder uses patterns learned from patent reactions to suggest ways to break the target into simpler pieces. It explores different branches in this way, looking for paths that lead back to starting materials listed in the ZINC stock catalog. RetroAI also checks the proposed routes against any lab stock you registered.
+RetroAI looks for similar experiments in the **Open Reaction Database (ORD)**. It uses evidence such as reported yields and failures, when available, to score the support for each step and flag the least-supported step as the **bottleneck**. The ORD confidence score summarizes that evidence; it is not a probability that the route will work.
+The overall ranking also considers the search score, the number of steps, starting material availability, and estimated safety. Use **Rank By** to emphasize practical considerations such as stock and safety (**CRO-Practical**), shorter routes (**Discovery (Fast)**), stronger experimental evidence (**Evidence-Backed (ORD)**), or estimated safety and environmental impact (**Green / Safe**). **Re-classify & Re-score (ORD + AI)** refreshes the evidence and scores for existing routes without starting a new search. A high score is not a substitute for lab validation or safety review.
+### Explore the other tabs
+- **Reaction** checks a reaction you draw or enter against similar recorded experiments.
+- **Analytical** predicts signals you might see in a mass spectrometry report. With Gemini enabled, it can also help interpret a pasted report.
+- **Chemist AI Agent** and **Structure Q&A** use Gemini to discuss your routes, molecules, and supporting evidence. Route search itself does not require Gemini.
+
 ## Local development
 
 From the repository root with Python 3.11 or newer:
