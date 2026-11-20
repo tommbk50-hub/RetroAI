@@ -1570,7 +1570,7 @@ class _Workbench:
     def _build_retrosynthesis_context(self) -> str:
         """Build a compact route and ORD precedent context for the chat agent."""
         res = deduplicate_retro_state(self.state.latest_retro_results)
-        target = res.get("target_smiles") or getattr(self.finder, "target_smiles", "") or "None"
+        target = res.get("target_smiles") or self.state.canvas_target_smiles or "None"
         routes = res.get("routes", [])
         if not routes:
             return f"Active Target SMILES: {target}\nORD DuckDB Index Size: {self.ord_validator.get_index_size()} reactions\nNo retrosynthesis routes have been generated yet."
@@ -1629,7 +1629,7 @@ class _Workbench:
             rxn_smi = f"{smi_a}.{smi_b}>>"
             info = _compute_descriptors_and_ro5(smi_a)
             return IPython.display.JSON({"smiles": rxn_smi, "source": f"{src_a} + {src_b}", "descriptors": info})
-        self.finder.target_smiles = _extract_primary_smiles(smi_a)
+        self.state.canvas_target_smiles = _extract_primary_smiles(smi_a)
         info = _compute_descriptors_and_ro5(smi_a)
         return IPython.display.JSON({"smiles": smi_a, "source": src_a, "descriptors": info})
 
@@ -1662,9 +1662,8 @@ class _Workbench:
                 locked_smarts = Chem.MolFragmentToSmarts(canon_mol, atomsToUse=locked_atoms)
             except Exception:
                 locked_smarts = ""
-        self.finder.target_smiles = canon_smi
-        self.finder.CustomFrozenAtoms = locked_atoms
-        self.finder.CustomFrozenSmarts = locked_smarts or None
+        self.state.canvas_target_smiles = canon_smi
+        self.state.canvas_lock_smarts = locked_smarts
         drawer = rdMolDraw2D.MolDraw2DSVG(380, 175)
         drawer.drawOptions().addAtomIndices = True
         drawer.DrawMolecule(canon_mol, highlightAtoms=locked_atoms, highlightAtomColors={i: (0.05, 0.72, 0.65) for i in locked_atoms})
@@ -1937,7 +1936,7 @@ class _Workbench:
     def _cb_chemist_agent_status(self):
         res = self.state.latest_retro_results
         routes = res.get("routes", [])
-        target = res.get("target_smiles") or getattr(self.finder, "target_smiles", "") or "None"
+        target = res.get("target_smiles") or self.state.canvas_target_smiles or "None"
         ram_mb = get_process_ram_mb()
         return IPython.display.JSON({
             "target_smiles": target,
@@ -1991,7 +1990,11 @@ class _Workbench:
         ) -> str:
             """Re-runs the AiZynthFinder retrosynthesis search + parallel ORD validation with updated constraints."""
             nonlocal updated_synthesis_html
-            target_smi = self.state.latest_retro_results.get("target_smiles") or _extract_primary_smiles(active_smiles) or getattr(self.finder, "target_smiles", "")
+            target_smi = (
+                self.state.latest_retro_results.get("target_smiles")
+                or _extract_primary_smiles(active_smiles)
+                or self.state.canvas_target_smiles
+            )
             excl = [x.strip() for x in (exclude_reactions_csv or "").split(",") if x.strip()]
             params = self.state.retro_search_params
             res = run_retrosynthesis_pipeline(

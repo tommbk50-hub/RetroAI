@@ -1,11 +1,13 @@
 import gzip
+import json
 from types import SimpleNamespace
 
 import pytest
 
-from retroai.ord import fingerprints, validator as ord_validator
+from retroai.ai import classifier
 from retroai.core.state import WorkbenchState
 from retroai.engine import aizynth, pipeline
+from retroai.ord import fingerprints, validator as ord_validator
 from ord_schema.proto import dataset_pb2, reaction_pb2
 
 
@@ -90,7 +92,47 @@ def test_validator_indexes_a_local_ord_shard_and_filters_precedents(tmp_path, mo
     assert validator.score_route([OXIDATION], step_reports=[report])["ord_mean_yield_pct"] == 72.0
 
 
-def test_pipeline_shares_template_and_lab_stock_state(tmp_path, monkeypatch):
+def test_padded_reaction_uses_harvested_template_and_preserves_input_key(tmp_path):
+    validator = ord_validator.ORDRetrosynthesisValidator(tmp_path / "ord.duckdb")
+    state = WorkbenchState(step_templates={
+        OXIDATION: {"retro_template": RETRO_TEMPLATE, "classification": "Alcohol oxidation"},
+    })
+    padded = f" {OXIDATION}\n"
+    results = classifier.batch_classify_with_gemini(
+        [padded], use_gemini=False, state=state, ord_validator=validator
+    )
+    assert list(results) == [padded]
+    assert results[padded]["reaction_name"] == "Alcohol oxidation"
+
+
+def test_gemini_cache_is_scoped_to_the_ord_validator(tmp_path, monkeypatch):
+    first = ord_validator.ORDRetrosynthesisValidator(tmp_path / "first.duckdb")
+    second = ord_validator.ORDRetrosynthesisValidator(tmp_path / "second.duckdb")
+    assert first.index_revision == second.index_revision
+    state = WorkbenchState()
+    offline_result = classifier.rdkit_classify_step(OXIDATION, ord_validator=first)
+    response = SimpleNamespace(text=json.dumps({"steps": [offline_result]}))
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        return response, "test-model", "medium"
+
+    monkeypatch.setattr(classifier, "get_gemini_client", object)
+    monkeypatch.setattr(classifier, "fetch_verified_literature_dois", lambda *args: [])
+    monkeypatch.setattr(classifier, "call_gemini_with_config", generate)
+
+    initial = classifier.batch_classify_with_gemini([OXIDATION], state=state, ord_validator=first)
+    assert initial[OXIDATION]["gemini_enriched"]
+    assert classifier.batch_classify_with_gemini([OXIDATION], state=state, ord_validator=first) == initial
+    assert len(calls) == 1
+
+    switched = classifier.batch_classify_with_gemini([OXIDATION], state=state, ord_validator=second)
+    assert switched[OXIDATION]["gemini_tag"] != initial[OXIDATION]["gemini_tag"]
+    assert len(calls) == 2
+
+
+def test_pipeline_applies_templates_and_lab_stock_without_leaking_canvas_locks(tmp_path, monkeypatch):
     node = SimpleNamespace(
         reaction_smiles=lambda: "CC=O>>CCO",
         metadata={"retro_template": RETRO_TEMPLATE, "classification": "Alcohol oxidation"},
@@ -99,6 +141,7 @@ def test_pipeline_shares_template_and_lab_stock_state(tmp_path, monkeypatch):
         reactions=lambda: [node],
         child_reactions=lambda node: [],
         leafs=lambda: [SimpleNamespace(smiles="CCO")],
+        molecules=lambda: [SimpleNamespace(smiles=smi) for smi in ("CCO", "CC=O")],
         in_stock=lambda leaf: False,
         is_solved=False,
     )
@@ -121,3 +164,16 @@ def test_pipeline_shares_template_and_lab_stock_state(tmp_path, monkeypatch):
     assert results["routes"][0]["starting_materials"]["precursors"][0]["source"] == "Lab Stock"
     assert finder.tree is None
     assert finder.routes == []
+
+    state.canvas_lock_smarts = "[N]"
+    locked = pipeline.run_retrosynthesis_pipeline("CC=O", use_gemini=False, state=state, ord_validator=validator)
+    assert locked["locked_substructure_smarts"] == "[N]"
+    assert locked["routes"] == []
+
+    other_state = WorkbenchState()
+    other_state.retro_search_params["validate_ord"] = False
+    unlocked = pipeline.run_retrosynthesis_pipeline(
+        "CC=O", use_gemini=False, state=other_state, ord_validator=validator
+    )
+    assert unlocked["locked_substructure_smarts"] == ""
+    assert len(unlocked["routes"]) == 1

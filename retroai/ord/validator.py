@@ -8,6 +8,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
+from uuid import uuid4
 
 import duckdb
 import numpy as np
@@ -184,6 +185,7 @@ class ORDRetrosynthesisValidator:
         self._scanned_shards_by_gate = {}
         self._loaded_shards = set()
         self._online_queried_steps = set()
+        self.cache_identity = uuid4().hex
         self.index_revision = 0
         self._validate_cached = functools.lru_cache(maxsize=256)(self._validate_step)
         self._init_db_and_seed()

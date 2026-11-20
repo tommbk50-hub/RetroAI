@@ -239,11 +239,17 @@ def batch_classify_with_gemini(
     if ord_validator is None:
         ord_validator = get_ord_validator()
     templates = state.step_templates if step_templates is None else step_templates
+    template_for_smiles = {
+        smi: templates.get(smi, templates.get((smi or "").strip(), {}))
+        for smi in forward_smiles_list
+    }
     cache = state.gemini_step_cache
     client = get_gemini_client() if use_gemini else None
-    tag = (ACTIVE_GENAI_SETTINGS.get("model"), ACTIVE_GENAI_SETTINGS.get("thinking_level"), ord_validator.index_revision)
-    for smi in dict.fromkeys(forward_smiles_list):
-        template = templates.get(smi, {})
+    tag = (
+        ACTIVE_GENAI_SETTINGS.get("model"), ACTIVE_GENAI_SETTINGS.get("thinking_level"),
+        ord_validator.index_revision, ord_validator.cache_identity,
+    )
+    for smi, template in template_for_smiles.items():
         key = (smi, *(template.get(field) or "" for field in _STEP_TEMPLATE_FIELDS))
         keys[smi] = key
         cached = cache.get(key) if client else None
@@ -272,7 +278,7 @@ def batch_classify_with_gemini(
     )
     for start in range(0, len(missing), 6):
         batch = missing[start:start + 6]
-        contexts = {smi: _verified_step_context(smi, results[smi], templates.get(smi, {})) for smi in batch}
+        contexts = {smi: _verified_step_context(smi, results[smi], template_for_smiles[smi]) for smi in batch}
         try:
             response, used_model, used_think = call_gemini_with_config(
                 contents=instruction + json.dumps(list(contexts.values()), ensure_ascii=False), temperature=0.1,

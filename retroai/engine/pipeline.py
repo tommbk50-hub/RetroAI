@@ -118,7 +118,7 @@ def run_retrosynthesis_pipeline(
     finder.target_smiles = canon_target
     processed_routes = []
     excl_tokens = [x.strip().lower() for x in (exclude_reaction_names or []) if x.strip()]
-    lock_smarts = (lock_substructure_smarts or getattr(finder, "CustomFrozenSmarts", "") or "").strip()
+    lock_smarts = (lock_substructure_smarts or state.canvas_lock_smarts).strip()
     lock_pat = Chem.MolFromSmarts(lock_smarts) if lock_smarts else None
     ord_prefetch_stats = {"queried_steps": 0, "added_records": 0, "elapsed_sec": 0.0}
 

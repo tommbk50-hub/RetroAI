@@ -30,6 +30,8 @@ class WorkbenchState:
     step_templates: dict[str, dict] = field(default_factory=dict)
     chem_svg_cards: set = field(default_factory=set)
     chemist_chat_history: list[dict] = field(default_factory=list)
+    canvas_target_smiles: str = ""
+    canvas_lock_smarts: str = ""
 
     def active_route_steps(self) -> list[dict]:
         """Return steps and their template metadata for ORD shard filtering."""

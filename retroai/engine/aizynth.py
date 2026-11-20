@@ -28,8 +28,6 @@ def get_finder():
     finder.stock.select("zinc")
     finder.expansion_policy.select("uspto")
     finder.filter_policy.select("uspto")
-    finder.CustomFrozenAtoms = []
-    finder.CustomFrozenSmarts = None
     return finder
 
 

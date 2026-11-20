@@ -18,14 +18,17 @@ import onnxruntime as ort
 if not getattr(ort.InferenceSession, "_chemforge_arena_patched", False):
     _orig_ort_init = ort.InferenceSession.__init__
 
-    def _low_mem_ort_init(self, path_or_bytes, sess_options=None, providers=None, **kwargs):
+    def _low_mem_ort_init(self, path_or_bytes, sess_options=None, providers=None, provider_options=None, **kwargs):
         if sess_options is None:
             sess_options = ort.SessionOptions()
         sess_options.enable_cpu_mem_arena = False
         sess_options.enable_mem_pattern = False
         sess_options.intra_op_num_threads = 2
         sess_options.inter_op_num_threads = 1
-        return _orig_ort_init(self, path_or_bytes, sess_options=sess_options, providers=providers, **kwargs)
+        return _orig_ort_init(
+            self, path_or_bytes, sess_options=sess_options, providers=providers,
+            provider_options=provider_options, **kwargs,
+        )
 
     ort.InferenceSession.__init__ = _low_mem_ort_init
     ort.InferenceSession._chemforge_arena_patched = True

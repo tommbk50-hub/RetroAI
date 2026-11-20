@@ -59,8 +59,9 @@ def test_onnx_session_patch_enforces_memory_options(monkeypatch, with_options):
 
     monkeypatch.setattr(config, "_orig_ort_init", record_init)
     options = config.ort.SessionOptions() if with_options else None
+    provider_options = [{}]
     config.ort.InferenceSession.__init__(
-        object(), "model.onnx", sess_options=options, providers=["CPUExecutionProvider"]
+        object(), "model.onnx", options, ["CPUExecutionProvider"], provider_options
     )
     effective = seen["sess_options"]
     if with_options:
@@ -70,6 +71,7 @@ def test_onnx_session_patch_enforces_memory_options(monkeypatch, with_options):
     assert effective.intra_op_num_threads == 2
     assert effective.inter_op_num_threads == 1
     assert seen["providers"] == ["CPUExecutionProvider"]
+    assert seen["provider_options"] is provider_options
     assert os.environ["ORT_DISABLE_MEMORY_ARENA"] == "1"
 
 
@@ -104,7 +106,10 @@ def test_workbench_registers_the_callbacks_used_by_the_frontend(monkeypatch):
     invoked = set(re.findall(r'invokeFunction\("(chemforge\.\w+)"', rendered[0]))
     assert invoked == callbacks.keys()
     assert len(callbacks) == 14
-    assert callbacks["chemforge.sync_canvas"]("CCO", "[0]").data["smiles"] == "CCO"
+    canvas = callbacks["chemforge.sync_canvas"]("CCO", "[0]").data
+    assert canvas["smiles"] == "CCO"
+    assert canvas["locked_atoms"] == [0]
+    assert canvas["locked_smarts"]
     assert callbacks["chemforge.agent_status"]().data["target_smiles"] == "CCO"
     callbacks["chemforge.sync_ord_shards"]()
     assert shard_sync_calls == [{"max_shards": 1, "route_steps": []}]
