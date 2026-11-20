@@ -69,9 +69,12 @@ def _scale_route_eln(route, target_smiles, scale_g, yield_override=None):
         product = _canonical_molecule_smiles(products[0])
         step_positions[step["step_index"]] = len(plans)
         producers[product].append(len(plans))
+        step_yield = override if override is not None else _clamp_step_yield(step.get("assumed_step_yield"))
+        if step_yield is None or step_yield <= 0:
+            return []
         plans.append({"step": step, "product": product, "product_mw": Descriptors.MolWt(products[0]),
                       "ingredients": _merge_step_stoichiometry(smi, step.get("reagent_stoichiometry")),
-                      "yield": override if override is not None else _clamp_step_yield(step.get("assumed_step_yield"))})
+                      "yield": step_yield})
     final_steps = producers.get(_canonical_molecule_smiles(target))
     if not final_steps:
         return []
@@ -1545,7 +1548,13 @@ class _Workbench:
         routes = res.get("routes", [])
         if not 1 <= int(route_idx) <= len(routes):
             return [], "Route index out of range."
-        plans = _scale_route_eln(routes[int(route_idx) - 1], res.get("target_smiles", ""), float(target_scale_grams), assumed_step_yield)
+        route = routes[int(route_idx) - 1]
+        plans = _scale_route_eln(route, res.get("target_smiles", ""), float(target_scale_grams), assumed_step_yield)
+        if not plans and assumed_step_yield is None and any(
+            _clamp_step_yield(step.get("assumed_step_yield")) in (None, 0.0)
+            for step in route.get("steps", [])
+        ):
+            return [], "No positive empirical yield is available for every step; provide an explicit scenario yield to build the ELN."
         if step_filter is not None:
             plans = [plan for plan in plans if plan["step"]["step_index"] == step_filter]
         return plans, "No scalable step for this target and scale." if not plans else ""

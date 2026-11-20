@@ -310,6 +310,9 @@ def test_unvalidated_confidence_is_lower_than_documented_negative_data(tmp_path)
     assert unvalidated["is_validated"] is False
     assert unvalidated["matched_smarts_label"] == "No verified match (Unvalidated)"
     assert unvalidated["step_ord_confidence"] == 0.20
+    assert classifier.rdkit_classify_step(
+        OXIDATION, ord_validator=validator
+    )["assumed_step_yield"] is None
 
     _insert_ord_record(
         validator, _ord_record("negative-hte", OXIDATION, 0)
@@ -320,6 +323,24 @@ def test_unvalidated_confidence_is_lower_than_documented_negative_data(tmp_path)
     assert validated["is_validated"] is True
     assert validated["hte_failure_rate_pct"] == 100.0
     assert validated["step_ord_confidence"] > unvalidated["step_ord_confidence"]
+    assert classifier.rdkit_classify_step(
+        OXIDATION, ord_validator=validator
+    )["assumed_step_yield"] == 0.0
+
+    from retroai.core.schemas import _clamp_step_yield
+    from retroai.ui.workbench import _scale_route_eln
+
+    assert _clamp_step_yield(0.0) == 0.0
+    assert _clamp_step_yield(None) is None
+    route = {"steps": [{
+        "step_index": 1,
+        "forward_smiles": OXIDATION,
+        "reagent_stoichiometry": [],
+        "precursor_steps": [],
+        "assumed_step_yield": 0.0,
+    }]}
+    assert _scale_route_eln(route, "CC=O", 1.0) == []
+    assert _scale_route_eln(route, "CC=O", 1.0, yield_override=0.5)
 
 
 def test_online_ord_failures_are_retried_only_after_incomplete_calls(tmp_path, monkeypatch):
