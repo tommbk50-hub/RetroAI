@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=78.1.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retroai"
+version = "0.1.0"
+description = "Interactive retrosynthesis workbench with RDKit, AiZynthFinder, ORD, and Gemini"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "rdkit",
+    "onnxruntime>=1.23,<2",
+    "tables",
+    "scipy",
+    "pydantic>=2,<3",
+    "deprecated>=1.2.13,<2",
+    "jinja2>=3.1.6,<4",
+    "networkx>=2.8,<3",
+    "pillow>=13",
+    "requests>=2.32.5,<3",
+    "urllib3>=2.8,<3",
+    "tqdm",
+    "pyyaml>=6",
+    "rdchiral",
+    "paretoset",
+    "marshmallow",
+    "jedi",
+    "google-genai>=1.49,<4",
+    "markdown",
+    "ord-schema>=0.9.6,<0.10",
+    "huggingface_hub",
+    "duckdb",
+    # Published ORD wheels require protobuf <6. Allow 6.x as soon as ORD does.
+    "protobuf>=5.29.6,<7",
+    "numpy",
+    "pandas<3",
+    "ipywidgets",
+    "ipython",
+    # Dependencies used by the ONNX engine when installed without dependency resolution.
+    "apted",
+    "psutil",
+    "swifter",
+    "wrapt-timeout-decorator",
+    "xxhash",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["retroai", "retroai.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
