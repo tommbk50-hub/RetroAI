@@ -18,3 +18,8 @@ python -m pytest
 Non-UI modules and tests do not require Colab, model data, or API keys. For route searches, use the notebook's separate AiZynthFinder and Reaction-Utils install and run `download_public_data data` from the directory in which you will run the search.
 
 The notebook installs Reaction-Utils with the engine using `--no-deps` because its published metadata would otherwise downgrade `urllib3` to a vulnerable 1.x release. RetroAI declares the ONNX engine's required libraries itself. The package also permits protobuf 5.29.6 because published `ord-schema` wheels require protobuf below 6; pinning protobuf to 6.31.1 or newer would make the base install unsatisfiable.
+
+
+## Live Repository Map
+<!-- AUTO-MAP:START -->
+<!-- AUTO-MAP:END -->
