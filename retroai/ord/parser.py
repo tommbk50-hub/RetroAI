@@ -11,10 +11,16 @@ import requests
 from ord_schema import message_helpers as ord_message_helpers
 from rdkit import Chem
 from rdkit.Chem import Descriptors
+from rdkit.Chem.MolStandardize import rdMolStandardize
 
 from retroai.core.chem_utils import _canonical_molecule_smiles, _extract_primary_smiles
 
-from .fingerprints import compute_folded_rxn_fp
+from .fingerprints import (
+    compute_drfp_bytes,
+    compute_folded_rxn_fp,
+    compute_rdkit_internal_delta_fg,
+    compute_rxn_center_diff_fp,
+)
 
 
 def _ord_enum_name(msg, field_name: str) -> str:
@@ -127,8 +133,53 @@ for _raw_s, _eng_name in _RAW_CHEM_NAME_PAIRS:
         _CANON_SMILES_TO_NAME[_raw_s] = _eng_name
 
 
+_SOLVENT_NAMES = frozenset({
+    "1,4-dioxane", "DME (1,2-dimethoxyethane)", "THF", "2-MeTHF", "DMF", "DMAc", "NMP",
+    "DMSO", "DCM", "DCE", "toluene", "MeCN", "EtOAc", "i-PrOAc", "i-PrOH", "n-BuOH",
+    "t-BuOH", "t-AmOH", "MeOH", "EtOH", "water", "cyclohexane", "heptane", "anisole",
+    "CPME",
+})
+_BASE_REAGENT_NAMES = frozenset({
+    "Cs2CO3", "K2CO3", "Na2CO3", "K3PO4", "NaOtBu", "KOtBu",
+    "NaOtAm (sodium tert-pentoxide)", "KOtAm", "Et3N", "DIPEA", "DBU",
+    "NaOH", "KOH", "LiOH",
+})
+_LARGEST_FRAGMENT_CHOOSER = rdMolStandardize.LargestFragmentChooser(preferOrganic=True)
+
+
+def _canonical_component_smiles(smi: str) -> str:
+    """Canonicalize one possibly multi-fragment component without selecting a fragment."""
+    mol = Chem.MolFromSmiles((smi or "").strip())
+    return _canonical_molecule_smiles(mol) if mol is not None else ""
+
+
+def _standardize_primary_smiles(smi: str) -> str:
+    """Canonicalize and desalt a molecule using RDKit's largest-fragment chooser."""
+    mol = Chem.MolFromSmiles((smi or "").strip())
+    if mol is None:
+        return ""
+    try:
+        mol = _LARGEST_FRAGMENT_CHOOSER.choose(mol)
+        Chem.SanitizeMol(mol)
+    except (ValueError, RuntimeError):
+        return ""
+    return _canonical_molecule_smiles(mol)
+
+
+def _known_spectator_role(smi: str) -> Optional[str]:
+    canonical = _canonical_component_smiles(smi)
+    primary = _standardize_primary_smiles(smi)
+    for candidate in (canonical, primary):
+        name = _CANON_SMILES_TO_NAME.get(candidate)
+        if name in _SOLVENT_NAMES:
+            return "SOLVENT"
+        if name in _BASE_REAGENT_NAMES:
+            return "REAGENT"
+    return None
+
+
 @functools.lru_cache(maxsize=512)
-def _smiles_to_english_name(smi_or_name: str) -> str:
+def _smiles_to_english_name(smi_or_name: str, allow_network: bool = False) -> str:
     """
     Translates a raw SMILES string (for a catalyst, ligand, reagent, or solvent)
     into a readable English chemical name using the canonical lookup table or PubChem.
@@ -163,6 +214,8 @@ def _smiles_to_english_name(smi_or_name: str) -> str:
         mapped_parts.extend(_CANON_SMILES_TO_NAME.get(p) for p in remaining)
         if mapped_parts and all(mapped_parts):
             return " + ".join(dict.fromkeys(mapped_parts))
+    if not allow_network:
+        return s
     # Query PubChem Title for unknown SMILES (cached via lru_cache)
     try:
         enc = urllib.parse.quote(canon, safe="")
@@ -179,12 +232,12 @@ def _smiles_to_english_name(smi_or_name: str) -> str:
     return s
 
 
-def _humanize_condition_list(raw_semi_str: str) -> str:
+def _humanize_condition_list(raw_semi_str: str, allow_network: bool = False) -> str:
     """Converts a semicolon-separated string of SMILES/names into English names."""
     if not isinstance(raw_semi_str, str) or not raw_semi_str or raw_semi_str in ("None", "Unspecified"):
         return raw_semi_str
     parts = [p.strip() for p in raw_semi_str.split(";") if p.strip()]
-    eng_parts = list(dict.fromkeys(_smiles_to_english_name(p) for p in parts))
+    eng_parts = list(dict.fromkeys(_smiles_to_english_name(p, allow_network=allow_network) for p in parts))
     return "; ".join(eng_parts)
 
 
@@ -253,10 +306,14 @@ def parse_ord_reaction_protobuf(rxn, admit=None) -> Optional[dict]:
     catalysts, reagents, solvents = [], [], []
     for _, inp in rxn.inputs.items():
         for comp in inp.components:
-            smi = _safe_compound_smiles(comp)
+            raw_smi = _safe_compound_smiles(comp)
+            smi = _standardize_primary_smiles(raw_smi)
             role = _ord_enum_name(comp, "reaction_role")
+            if role == "UNSPECIFIED" and (spectator_role := _known_spectator_role(raw_smi)):
+                role = spectator_role
             if role in ("CATALYST", "REAGENT", "SOLVENT"):
-                condition_compounds.append((role, comp, smi))
+                condition_smi = _canonical_component_smiles(raw_smi) or smi
+                condition_compounds.append((role, comp, condition_smi))
             elif role in ("REACTANT", "UNSPECIFIED"):
                 if smi and smi not in reactant_smis:
                     reactant_smis.append(smi)
@@ -269,9 +326,18 @@ def parse_ord_reaction_protobuf(rxn, admit=None) -> Optional[dict]:
     for outcome in rxn.outcomes:
         prods = list(outcome.products)
         any_marked_desired = any(getattr(p, "is_desired_product", False) for p in prods)
+        yielded_products = {
+            id(prod)
+            for prod in prods
+            if any(_ord_enum_name(meas, "type") == "YIELD" for meas in getattr(prod, "measurements", []))
+        }
         for prod in prods:
-            is_desired = getattr(prod, "is_desired_product", False) or (not any_marked_desired and len(prods) == 1)
-            p_smi = _safe_compound_smiles(prod)
+            is_desired = (
+                getattr(prod, "is_desired_product", False)
+                or (not any_marked_desired and id(prod) in yielded_products)
+                or (not any_marked_desired and not yielded_products and len(prods) == 1)
+            )
+            p_smi = _standardize_primary_smiles(_safe_compound_smiles(prod))
             if is_desired:
                 if p_smi and p_smi not in product_smis:
                     product_smis.append(p_smi)
@@ -300,9 +366,17 @@ def parse_ord_reaction_protobuf(rxn, admit=None) -> Optional[dict]:
                 clean_part = raw_rxn_smi.strip().split()[0]
                 parts = clean_part.split(">")
                 if not reactant_smis and parts[0].strip():
-                    reactant_smis = [x.strip() for x in parts[0].split(".") if x.strip()]
+                    reactant_smis = list(dict.fromkeys(
+                        canonical
+                        for x in parts[0].split(".")
+                        if (canonical := _standardize_primary_smiles(x.strip()))
+                    ))
                 if not product_smis and parts[-1].strip():
-                    product_smis = [x.strip() for x in parts[-1].split(".") if x.strip()]
+                    product_smis = list(dict.fromkeys(
+                        canonical
+                        for x in parts[-1].split(".")
+                        if (canonical := _standardize_primary_smiles(x.strip()))
+                    ))
         except Exception:
             pass
 
@@ -380,6 +454,12 @@ def parse_ord_reaction_protobuf(rxn, admit=None) -> Optional[dict]:
     fp_bytes = compute_folded_rxn_fp(clean_rxn_smi)
     if fp_bytes is None:
         return None
+    drfp_bytes = compute_drfp_bytes(clean_rxn_smi)
+    diff_fp = compute_rxn_center_diff_fp(clean_rxn_smi)
+    diff_fp_bytes = diff_fp.ToBinary() if diff_fp is not None else None
+    consumed, formed, _ = compute_rdkit_internal_delta_fg(clean_rxn_smi)
+    consumed_fgs = sorted(consumed.elements()) if hasattr(consumed, "elements") else sorted(consumed)
+    formed_fgs = sorted(formed.elements()) if hasattr(formed, "elements") else sorted(formed)
     time_outcome = best_outcome if best_outcome is not None else next(iter(rxn.outcomes), None)
     duration_h = _ord_quantity(time_outcome, "reaction_time", {"DAY": 24, "HOUR": 1, "MINUTE": 1 / 60, "SECOND": 1 / 3600})
 
@@ -397,6 +477,10 @@ def parse_ord_reaction_protobuf(rxn, admit=None) -> Optional[dict]:
         "undesired_byproducts": "; ".join(undesired_byproducts[:3]) or "None",
         "reference": ref,
         "fp_bytes": fp_bytes,
+        "drfp_bytes": drfp_bytes,
+        "diff_fp_bytes": diff_fp_bytes,
+        "consumed_fgs": json.dumps(consumed_fgs),
+        "formed_fgs": json.dumps(formed_fgs),
         "procedure_details": rxn.notes.procedure_details,
         "doi": doi,
         "patent_id": patent,

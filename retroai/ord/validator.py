@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 from uuid import uuid4
@@ -30,10 +31,12 @@ from .fingerprints import (
     _parse_reaction_mols,
     _rdkit_extract_reacting_cores,
     build_progressive_reaction_smarts,
+    compute_drfp_bytes,
     compute_folded_rxn_fp,
     compute_rdkit_internal_delta_fg,
     compute_rxn_center_diff_fp,
     matches_reaction_smarts_mols,
+    tanimoto_packed_fp_batch,
 )
 from .parser import _humanize_condition_list, parse_ord_reaction_protobuf
 
@@ -60,6 +63,18 @@ def _ord_gate_specs(forward_smiles_list, route_steps):
                          for step in route_steps if ">>" in step.get("forward_smiles", ""))
 
 
+def _counter_from_json(value) -> Counter:
+    try:
+        items = json.loads(value) if isinstance(value, str) else value
+        return Counter(items) if isinstance(items, (list, tuple)) else Counter()
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return Counter()
+
+
+def _delta_cache_key(delta) -> tuple:
+    return tuple(tuple(sorted(Counter(groups).items())) for groups in delta[:2])
+
+
 def _submit_and_poll_ord_session(
     params: List[tuple],
     timeout_sec: float = 3.2,
@@ -77,14 +92,14 @@ def _submit_and_poll_ord_session(
             timeout=1.8,
         )
         if sub_resp.status_code != 200:
-            return []
+            raise RuntimeError(f"ORD query submission returned HTTP {sub_resp.status_code}")
         try:
             payload = sub_resp.json()
             task_id = payload.get("task_id", payload) if isinstance(payload, dict) else str(payload)
         except Exception:
             task_id = sub_resp.text.strip().strip('"')
         if not task_id:
-            return []
+            raise RuntimeError("ORD query submission returned no task identifier")
 
         while time.time() < deadline:
             remaining = max(0.4, deadline - time.time())
@@ -96,7 +111,7 @@ def _submit_and_poll_ord_session(
             if poll_resp.status_code == 200:
                 items = poll_resp.json()
                 if not isinstance(items, list):
-                    return []
+                    raise RuntimeError("ORD query result was not a list")
                 out_protos = []
                 for item in items:
                     b64_proto = item.get("proto") if isinstance(item, dict) else None
@@ -109,10 +124,10 @@ def _submit_and_poll_ord_session(
             elif poll_resp.status_code in (202, 404):
                 time.sleep(poll_interval)
             else:
-                break
-    except Exception:
-        pass
-    return []
+                raise RuntimeError(f"ORD query polling returned HTTP {poll_resp.status_code}")
+    except requests.RequestException as exc:
+        raise RuntimeError(f"ORD query request failed: {exc}") from exc
+    raise TimeoutError("ORD query timed out before returning a completed result")
 
 
 def _fetch_step_ord_records_worker(
@@ -121,6 +136,7 @@ def _fetch_step_ord_records_worker(
     similarity_threshold: float = 0.40,
     per_step_timeout: float = 6.0,
     core_product: str = "",
+    core_reactant: str = "",
 ) -> List[bytes]:
     """
     Worker function executed inside ThreadPoolExecutor.
@@ -136,6 +152,8 @@ def _fetch_step_ord_records_worker(
     p_smi = _extract_primary_smiles(prod_s)
     if not p_smi:
         return []
+    if not core_reactant:
+        core_reactant = _rdkit_extract_reacting_cores(s)["core_reactant"]
 
     t0 = time.time()
     tier1_params = [
@@ -144,8 +162,8 @@ def _fetch_step_ord_records_worker(
         ("use_stereochemistry", "false"),
         ("limit", str(limit)),
     ]
-    if r_list:
-        tier1_params.append(("component", f"{r_list[0]};input;similarity"))
+    if core_reactant or r_list:
+        tier1_params.append(("component", f"{core_reactant or r_list[0]};input;similarity"))
 
     raw_protos = _submit_and_poll_ord_session(
         tier1_params,
@@ -155,9 +173,10 @@ def _fetch_step_ord_records_worker(
 
     elapsed = time.time() - t0
     if not raw_protos and core_product and elapsed < (per_step_timeout - 1.0):
+        fallback_threshold = max(0.30, similarity_threshold - 0.10)
         tier2_params = [
             ("component", f"{core_product};output;similarity"),
-            ("similarity", str(max(0.32, similarity_threshold - 0.08))),
+            ("similarity", f"{fallback_threshold:.2f}"),
             ("use_stereochemistry", "false"),
             ("limit", str(limit)),
         ]
@@ -172,8 +191,8 @@ def _fetch_step_ord_records_worker(
 
 class ORDRetrosynthesisValidator:
     """
-    Validates proposed retrosynthesis steps against ORD Parquet shards & live online ORD queries:
-      1. SMARTS/ΔFG admission, then structural/difference fingerprint ranking and yield tie-breaks
+    Validates proposed retrosynthesis steps against local ORD shards and live online ORD queries:
+      1. Exact connectivity/DRFP retrieval, then SMARTS/ΔFG chemical admission and ranking
       2. Empirical Feasibility & 'Negative Data' Filtering (Yield stats, HTE <15% failure rate, ORD side-products)
       3. Forward Condition Grounding (Consensus catalyst, reagent, solvent, temperature, atmosphere, DOI)
       4. Route-Level Composite Scoring (ORD Empirical Confidence Score)
@@ -213,6 +232,10 @@ class ORDRetrosynthesisValidator:
         for column in ("procedure_details", "doi", "patent_id", "condition_stoichiometry"):
             con.execute(f"ALTER TABLE ord_reactions ADD COLUMN IF NOT EXISTS {column} VARCHAR DEFAULT ''")
         con.execute("ALTER TABLE ord_reactions ADD COLUMN IF NOT EXISTS duration_h DOUBLE")
+        con.execute("ALTER TABLE ord_reactions ADD COLUMN IF NOT EXISTS drfp_bytes BLOB")
+        con.execute("ALTER TABLE ord_reactions ADD COLUMN IF NOT EXISTS diff_fp_bytes BLOB")
+        con.execute("ALTER TABLE ord_reactions ADD COLUMN IF NOT EXISTS consumed_fgs VARCHAR DEFAULT '[]'")
+        con.execute("ALTER TABLE ord_reactions ADD COLUMN IF NOT EXISTS formed_fgs VARCHAR DEFAULT '[]'")
         con.execute("CREATE INDEX IF NOT EXISTS idx_ord_conn ON ord_reactions (prod_connectivity)")
         # Purge any legacy hardcoded seed records so only real ORD reactions exist in DuckDB
         con.execute("""
@@ -223,11 +246,62 @@ class ORDRetrosynthesisValidator:
                 'ord-3f6d99c11a234b4e88a7', 'ord-0e8b55d31c774a2f66d0'
             )
         """)
+        self._backfill_missing_features(con)
         con.close()
+
+    def _backfill_missing_features(self, con):
+        """Populate DRFP and functional-group features for legacy rows in bounded batches."""
+        last_ord_id = ""
+        while True:
+            rows = con.execute(
+                """
+                SELECT ord_id, rxn_smiles
+                FROM ord_reactions
+                WHERE ord_id > ? AND (
+                    drfp_bytes IS NULL OR diff_fp_bytes IS NULL
+                    OR consumed_fgs IS NULL OR formed_fgs IS NULL
+                )
+                ORDER BY ord_id
+                LIMIT 256
+                """,
+                [last_ord_id],
+            ).fetchall()
+            if not rows:
+                return
+            for ord_id, rxn_smiles in rows:
+                diff_fp = compute_rxn_center_diff_fp(rxn_smiles or "")
+                consumed, formed, _ = compute_rdkit_internal_delta_fg(rxn_smiles or "")
+                consumed_fgs = sorted(consumed.elements()) if hasattr(consumed, "elements") else sorted(consumed)
+                formed_fgs = sorted(formed.elements()) if hasattr(formed, "elements") else sorted(formed)
+                con.execute(
+                    """
+                    UPDATE ord_reactions
+                    SET drfp_bytes = ?, diff_fp_bytes = ?, consumed_fgs = ?, formed_fgs = ?
+                    WHERE ord_id = ?
+                    """,
+                    [compute_drfp_bytes(rxn_smiles or ""),
+                     diff_fp.ToBinary() if diff_fp is not None else None,
+                     json.dumps(consumed_fgs), json.dumps(formed_fgs), ord_id],
+                )
+            last_ord_id = rows[-1][0]
 
     def _refresh_index(self):
         with duckdb.connect(self.db_path, read_only=True) as con:
             self._index_size = con.execute("SELECT count(*) FROM ord_reactions").fetchone()[0]
+            rows = con.execute(
+                "SELECT ord_id, drfp_bytes FROM ord_reactions WHERE drfp_bytes IS NOT NULL ORDER BY ord_id"
+            ).fetchall()
+        indexed = [
+            (ord_id, np.frombuffer(bytes(fingerprint), dtype=np.uint8).copy())
+            for ord_id, fingerprint in rows
+            if fingerprint and len(fingerprint) == 256
+        ]
+        self._drfp_ord_ids = np.asarray([ord_id for ord_id, _ in indexed], dtype=object)
+        self._drfp_matrix = (
+            np.stack([fingerprint for _, fingerprint in indexed]).astype(np.uint8, copy=False)
+            if indexed
+            else np.empty((0, 256), dtype=np.uint8)
+        )
         self.index_revision += 1
         self._validate_cached.cache_clear()
 
@@ -260,7 +334,6 @@ class ORDRetrosynthesisValidator:
             local_check = self._validate_cached(smi, 1, template, mapped)
             if local_check.get("max_rxn_similarity", 0.0) < 0.55 and local_check.get("exact_product_hits", 0) == 0:
                 steps_to_fetch.add(smi)
-                self._online_queried_steps.add(smi)
 
         if not steps_to_fetch:
             hf_added = self._auto_sync_hf_ord_if_sparse(forward_smiles_list, route_steps)
@@ -274,7 +347,7 @@ class ORDRetrosynthesisValidator:
         raw_proto_batches = []
         n_workers = min(max_workers, len(steps_to_fetch))
         per_step_budget = min(6.0, max(2.0, wall_timeout_sec - 0.5))
-        core_products = {smi: _rdkit_extract_reacting_cores(smi)["core_product"] for smi in steps_to_fetch}
+        cores = {smi: _rdkit_extract_reacting_cores(smi) for smi in steps_to_fetch}
 
         executor = ThreadPoolExecutor(max_workers=n_workers)
         future_to_smi = {
@@ -284,7 +357,8 @@ class ORDRetrosynthesisValidator:
                 limit_per_step,
                 0.40,
                 per_step_budget,
-                core_products[smi],
+                cores[smi]["core_product_scaffold"],
+                cores[smi]["core_reactant"],
             ): smi
             for smi in steps_to_fetch
         }
@@ -295,7 +369,9 @@ class ORDRetrosynthesisValidator:
                     pb_list = fut.result(timeout=0.05)
                     if pb_list:
                         raw_proto_batches.extend(pb_list)
-                except Exception:
+                    self._online_queried_steps.add(future_to_smi[fut])
+                except Exception as exc:
+                    logging.warning("Online ORD lookup for %r failed: %s", future_to_smi[fut], exc)
                     continue
         except Exception:
             pass
@@ -352,13 +428,13 @@ class ORDRetrosynthesisValidator:
     def sync_huggingface_parquet_shards(self, max_shards: int = 3, max_reactions_per_shard: int = 5000,
                                         custom_smarts_list: Optional[List[str]] = None,
                                         forward_smiles_list: Optional[List[str]] = None, *, route_steps=None) -> dict:
-        """Index bounded ORD shards, filtering to the active steps when available."""
+        """Index bounded ORD protobuf shards, filtering to the active steps when available."""
         gates = [(build_progressive_reaction_smarts(smi, template, mapped), compute_rdkit_internal_delta_fg(smi))
                  for smi, template, mapped in _ord_gate_specs(forward_smiles_list, route_steps) if _parse_reaction_mols(smi)[0]]
         custom_smarts = tuple(sorted(set(custom_smarts_list or [])))
         custom_queries = [q for sm in custom_smarts if (q := _compile_rxn_smarts_queries(sm))]
         # A filtered scan only covers its own gate. A different target may need the same shard.
-        gate_key = (frozenset((tuple(t['smarts'] for t in tiers), delta[:2]) for tiers, delta in gates),
+        gate_key = (frozenset((tuple(t['smarts'] for t in tiers), _delta_cache_key(delta)) for tiers, delta in gates),
                     custom_smarts, max_reactions_per_shard)
         if gate_key not in self._scanned_shards_by_gate and len(self._scanned_shards_by_gate) >= 32:
             del self._scanned_shards_by_gate[next(iter(self._scanned_shards_by_gate))]
@@ -379,10 +455,16 @@ class ORDRetrosynthesisValidator:
         logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
         try:
             all_files = list_repo_files(repo_id=repo_id, repo_type="dataset", token=token)
-            parquet_files = [f for f in all_files if f.endswith((".parquet", ".pb.gz", ".pb"))]
+            parquet_files = [f for f in all_files if f.endswith(".parquet")]
+            protobuf_files = [f for f in all_files if f.endswith((".pb.gz", ".pb"))]
+            if parquet_files:
+                logging.warning(
+                    "Skipping %d unsupported ORD Parquet shard(s); only protobuf .pb/.pb.gz shards are loaded",
+                    len(parquet_files),
+                )
             # Prioritize diverse benchmark datasets (including ord_dataset-00005539a1e04c809a9a78647bea649c) first
-            priority = [f for f in parquet_files if "00005539a1e04c809a9a78647bea649c" in f]
-            others = [f for f in parquet_files if f not in priority]
+            priority = [f for f in protobuf_files if "00005539a1e04c809a9a78647bea649c" in f]
+            others = [f for f in protobuf_files if f not in priority]
             ordered_files = priority + others
             target_shards = [f for f in ordered_files if f not in scanned][:max(1, int(max_shards))]
         except Exception as e:
@@ -410,7 +492,8 @@ class ORDRetrosynthesisValidator:
                     added_total += len(records)
                 scanned.add(shard)
                 self._loaded_shards.add(shard)
-            except Exception:
+            except Exception as exc:
+                logging.warning("Skipping ORD shard %s: %s", shard, exc)
                 continue
         con.close()
         if added_total:
@@ -427,39 +510,111 @@ class ORDRetrosynthesisValidator:
         return self._validate_cached(s, top_k, info.get("retro_template", ""), info.get("mapped_forward_smiles", ""))
 
     def _validate_step(self, s, top_k, template, mapped):
-        """Admit via SMARTS/ΔFG first; only then use fingerprints and yield to rank."""
+        """Run exact, DRFP, chemical-gate, and empirical-ranking validation stages."""
         _, products = _parse_reaction_mols(s)
-        prod_conn = Chem.MolToInchiKey(products[0]).split("-")[0] if products else ""
+        primary_product = Chem.MolFromSmiles(_extract_primary_smiles(s))
+        prod_conn = Chem.MolToInchiKey(primary_product).split("-")[0] if primary_product else ""
         tiers = build_progressive_reaction_smarts(s, template, mapped) if products else []
         delta = compute_rdkit_internal_delta_fg(s)
-        matched_smarts_label, best_gate_base, exact_hits = "No verified match", 0.0, 0
+        matched_smarts_label, best_gate_base, exact_hits = "No verified match (Unvalidated)", 0.0, 0
         analog_records = []
-        if tiers or (delta[0] and delta[1]):
+        if tiers or delta[0] or delta[1]:
+            query_drfp = compute_drfp_bytes(s)
             q_bits = int.from_bytes(compute_folded_rxn_fp(s) or b"", "big")
-            q_diff = compute_rxn_center_diff_fp(s)
+            q_diff = None
+            exact_ord_ids, candidate_ord_ids = set(), set()
+            drfp_similarity_by_id = {}
+
             with duckdb.connect(self.db_path, read_only=True) as con:
-                cursor = con.execute("SELECT * FROM ord_reactions")
-                columns = [col[0] for col in cursor.description]
-                while rows := cursor.fetchmany(256):
-                    for row in rows:
-                        rec = dict(zip(columns, row))
-                        rxn = rec["rxn_smiles"] or ""
-                        gate = _match_ord_gate(*_parse_reaction_mols(rxn), compute_rdkit_internal_delta_fg(rxn), tiers, delta)
-                        if not gate:
-                            continue
-                        label, base = gate
-                        if base > best_gate_base or (base == best_gate_base and matched_smarts_label == "RDKit ΔFG match"):
-                            matched_smarts_label, best_gate_base = label, base
-                        exact_hits += bool(prod_conn and rec["prod_connectivity"] == prod_conn)
-                        c_bits = int.from_bytes(rec["fp_bytes"] or compute_folded_rxn_fp(rxn) or b"", "big")
-                        union = (q_bits | c_bits).bit_count()
-                        struct_sim = (q_bits & c_bits).bit_count() / union if union else 0.0
-                        c_diff = compute_rxn_center_diff_fp(rxn) if q_diff is not None else None
-                        diff_sim = DataStructs.TanimotoSimilarity(q_diff, c_diff) if c_diff is not None else 0.0
-                        rec["similarity"] = 0.45 * base + 0.55 * (0.50 * struct_sim + 0.50 * diff_sim)
-                        rec["matched_smarts_label"] = label
-                        del rec["fp_bytes"]
-                        analog_records.append(rec)
+                if prod_conn:
+                    exact_ord_ids = {
+                        row[0]
+                        for row in con.execute(
+                            "SELECT ord_id FROM ord_reactions WHERE prod_connectivity = ?",
+                            [prod_conn],
+                        ).fetchall()
+                    }
+                candidate_ord_ids.update(exact_ord_ids)
+
+                if self._index_size <= 300:
+                    candidate_ord_ids.update(
+                        row[0] for row in con.execute("SELECT ord_id FROM ord_reactions").fetchall()
+                    )
+                elif query_drfp and self._drfp_matrix.size:
+                    similarities = tanimoto_packed_fp_batch(query_drfp, self._drfp_matrix)
+                    eligible = np.flatnonzero(similarities >= 0.15)
+                    ranked = sorted(
+                        eligible,
+                        key=lambda idx: (-float(similarities[idx]), str(self._drfp_ord_ids[idx])),
+                    )[:200]
+                    for idx in ranked:
+                        ord_id = str(self._drfp_ord_ids[idx])
+                        candidate_ord_ids.add(ord_id)
+                        drfp_similarity_by_id[ord_id] = float(similarities[idx])
+
+                if candidate_ord_ids:
+                    placeholders = ",".join("?" for _ in candidate_ord_ids)
+                    cursor = con.execute(
+                        f"SELECT * FROM ord_reactions WHERE ord_id IN ({placeholders})",
+                        sorted(candidate_ord_ids),
+                    )
+                    columns = [col[0] for col in cursor.description]
+                    candidate_rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+                else:
+                    candidate_rows = []
+
+            for rec in candidate_rows:
+                rxn = rec["rxn_smiles"] or ""
+                candidate_delta = (
+                    _counter_from_json(rec.get("consumed_fgs")),
+                    _counter_from_json(rec.get("formed_fgs")),
+                    Counter(),
+                )
+                gate = _match_ord_gate(
+                    *_parse_reaction_mols(rxn), candidate_delta, tiers, delta
+                )
+                if not gate:
+                    continue
+                label, base = gate
+                if base > best_gate_base or (
+                    base == best_gate_base and matched_smarts_label == "RDKit ΔFG match"
+                ):
+                    matched_smarts_label, best_gate_base = label, base
+                exact_hits += rec["ord_id"] in exact_ord_ids
+
+                c_bits = int.from_bytes(rec["fp_bytes"] or compute_folded_rxn_fp(rxn) or b"", "big")
+                union = (q_bits | c_bits).bit_count()
+                struct_sim = (q_bits & c_bits).bit_count() / union if union else 0.0
+
+                drfp_sim = drfp_similarity_by_id.get(rec["ord_id"])
+                if drfp_sim is None and query_drfp and rec.get("drfp_bytes"):
+                    drfp_sim = float(tanimoto_packed_fp_batch(
+                        query_drfp, np.frombuffer(bytes(rec["drfp_bytes"]), dtype=np.uint8).reshape(1, -1)
+                    )[0])
+                if drfp_sim is None:
+                    if q_diff is None:
+                        q_diff = compute_rxn_center_diff_fp(s)
+                    c_diff = None
+                    if q_diff is not None and rec.get("diff_fp_bytes"):
+                        try:
+                            c_diff = DataStructs.UIntSparseIntVect(bytes(rec["diff_fp_bytes"]))
+                        except (TypeError, ValueError, RuntimeError):
+                            pass
+                    if q_diff is not None and c_diff is None:
+                        c_diff = compute_rxn_center_diff_fp(rxn)
+                    drfp_sim = (
+                        float(DataStructs.TanimotoSimilarity(q_diff, c_diff))
+                        if c_diff is not None else 0.0
+                    )
+
+                rec["similarity"] = (
+                    0.45 * base + 0.55 * (0.50 * struct_sim + 0.50 * drfp_sim)
+                )
+                rec["matched_smarts_label"] = label
+                rec.pop("fp_bytes", None)
+                rec.pop("drfp_bytes", None)
+                rec.pop("diff_fp_bytes", None)
+                analog_records.append(rec)
 
         analog_records.sort(key=lambda x: (-x["similarity"], -(x["yield_pct"] if x["yield_pct"] is not None else -1.0), x["ord_id"]))
 
@@ -510,16 +665,23 @@ class ORDRetrosynthesisValidator:
             grounded_ref = f"{grounded_source['ord_id']} ({grounded_source.get('yield_pct', 'N/A')}% yield, {grounded_source.get('reference', '')})"
 
         max_sim = float(analog_records[0]["similarity"]) if analog_records else 0.0
-        norm_yield = (mean_yield / 100.0) if mean_yield is not None else 0.60
-        fail_penalty_factor = 1.0 - 0.35 * ((hte_fail_rate / 100.0) if hte_fail_rate else 0.0)
-        raw_step_conf = (0.60 * (max_sim if analog_records else 0.35) + 0.40 * norm_yield) * fail_penalty_factor
-        step_ord_confidence = round(float(min(0.99, max(0.10, raw_step_conf))), 3)
+        if analog_records:
+            norm_yield = (mean_yield / 100.0) if mean_yield is not None else 0.60
+            fail_penalty_factor = 1.0 - 0.35 * ((hte_fail_rate / 100.0) if hte_fail_rate else 0.0)
+            raw_step_conf = (0.60 * max_sim + 0.40 * norm_yield) * fail_penalty_factor
+            step_ord_confidence = round(float(min(0.99, max(0.21, raw_step_conf))), 3)
+        else:
+            step_ord_confidence = 0.20
 
         return {
+            "is_validated": bool(analog_records),
             "exact_product_hits": exact_hits,
             "smarts_matched_count": len(analog_records),
             "matched_smarts_label": matched_smarts_label,
-            "rdkit_delta_fg_signature": dict(zip(("consumed_fgs", "formed_fgs", "reactant_fgs"), map(sorted, delta))),
+            "rdkit_delta_fg_signature": dict(zip(
+                ("consumed_fgs", "formed_fgs", "reactant_fgs"),
+                (sorted(Counter(groups).elements()) for groups in delta),
+            )),
             "max_rxn_similarity": round(max_sim, 3),
             "mean_analog_yield_pct": mean_yield,
             "median_analog_yield_pct": median_yield,
