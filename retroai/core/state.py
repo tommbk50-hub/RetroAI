@@ -17,6 +17,7 @@ def _default_search_params() -> dict:
         "exclude_reaction_names": [],
         "use_gemini": True,
         "validate_ord": True,
+        "use_common_lab_reagents": True,
     }
 
 

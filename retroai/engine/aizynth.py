@@ -13,6 +13,75 @@ from retroai.core.state import WorkbenchState
 from retroai.ord.fingerprints import _parse_reaction_mols, _reverse_reaction
 
 
+COMMON_LAB_REAGENTS = {
+    "MeI": "CI",
+    "Br2": "BrBr",
+    "I2": "II",
+    "H2O2": "OO",
+    "SOCl2": "O=S(Cl)Cl",
+    "H2O": "O",
+    "NH3": "N",
+    "Ac2O": "CC(=O)OC(C)=O",
+    "MsCl": "CS(=O)(=O)Cl",
+    "TMSCl": "C[Si](C)(C)Cl",
+}
+
+
+@lru_cache(maxsize=1)
+def _common_lab_reagent_keys() -> tuple[set[str], set[str]]:
+    smiles, inchikeys = set(), set()
+    for raw in COMMON_LAB_REAGENTS.values():
+        mol = Chem.MolFromSmiles(raw)
+        if mol is not None:
+            smiles.add(Chem.MolToSmiles(mol))
+            inchikeys.add(Chem.MolToInchiKey(mol))
+    return smiles, inchikeys
+
+
+def is_common_lab_reagent(smiles: str) -> bool:
+    """Return whether a valid SMILES is in the ubiquitous-reagent allowlist."""
+    mol = Chem.MolFromSmiles((smiles or "").strip())
+    if mol is None:
+        return False
+    smiles_set, inchikey_set = _common_lab_reagent_keys()
+    return Chem.MolToSmiles(mol) in smiles_set or Chem.MolToInchiKey(mol) in inchikey_set
+
+
+def configure_finder_runtime_stock(finder, *, state: WorkbenchState) -> int:
+    """Add session stock and the optional common-reagent allowlist to the search stock."""
+    stock = getattr(finder, "stock", None)
+    if stock is None or not hasattr(stock, "load") or not hasattr(stock, "select"):
+        return 0
+    from aizynthfinder.context.stock.queries import StockQueryMixin
+
+    inchikeys = set(state.custom_lab_stock_inchikeys)
+    if state.retro_search_params.get("use_common_lab_reagents", True):
+        inchikeys.update(_common_lab_reagent_keys()[1])
+
+    class _RuntimeStockQuery(StockQueryMixin):
+        def __init__(self, values):
+            self._values = frozenset(values)
+
+        def __contains__(self, mol):
+            return mol.inchi_key in self._values
+
+        def __len__(self):
+            return len(self._values)
+
+        def availability_string(self, mol):
+            return "RetroAI Runtime Stock" if mol in self else ""
+
+    key = "retroai_runtime"
+    selection = getattr(stock, "selection", None) or []
+    selected = [selection] if isinstance(selection, str) else list(selection)
+    selected = [item for item in selected if item != key]
+    if inchikeys:
+        stock.load(_RuntimeStockQuery(inchikeys), key)
+        selected.append(key)
+    stock.select(selected or "zinc")
+    return len(inchikeys)
+
+
 @lru_cache(maxsize=1)
 def get_finder():
     """Load and configure AiZynthFinder on first use."""
@@ -127,13 +196,23 @@ def cleanup_aizynth_memory(
     return get_process_ram_mb()
 
 
-def register_custom_lab_stock(smiles_list: List[str], *, state: WorkbenchState) -> int:
+def register_custom_lab_stock(
+    smiles_list: List[str],
+    *,
+    state: WorkbenchState,
+    include_common_reagents: bool = False,
+) -> int:
     """Validates custom SMILES via RDKit and registers them as $0 on-shelf Lab Stock."""
     added = 0
-    for raw in smiles_list:
+    candidates = list(smiles_list)
+    if include_common_reagents:
+        candidates.extend(COMMON_LAB_REAGENTS.values())
+    for raw in candidates:
         mol = Chem.MolFromSmiles((raw or "").strip())
         if mol is not None:
-            state.custom_lab_stock_smiles.add(Chem.MolToSmiles(mol))
+            canonical = Chem.MolToSmiles(mol)
+            if canonical not in state.custom_lab_stock_smiles:
+                added += 1
+            state.custom_lab_stock_smiles.add(canonical)
             state.custom_lab_stock_inchikeys.add(Chem.MolToInchiKey(mol))
-            added += 1
     return added

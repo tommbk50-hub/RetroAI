@@ -4,8 +4,8 @@ from typing import List, Optional
 
 from rdkit import Chem
 
-from retroai.ai.classifier import _classify_route_steps, _route_step_key
-from retroai.core.chem_utils import _extract_primary_smiles
+from retroai.ai.classifier import _classify_route_steps, _route_step_key, classify_step_strategy_role
+from retroai.core.chem_utils import _canonical_molecule_smiles, _extract_primary_smiles, rdkit_reaction_complexity
 from retroai.core.config import ACTIVE_GENAI_SETTINGS, get_process_ram_mb
 from retroai.core.state import WorkbenchState
 from retroai.ord.validator import ORDRetrosynthesisValidator, get_ord_validator
@@ -14,8 +14,200 @@ from .aizynth import (
     _flatten_reaction_tree,
     _harvest_uspto_templates_from_finder,
     cleanup_aizynth_memory,
+    configure_finder_runtime_stock,
     get_finder,
+    is_common_lab_reagent,
 )
+
+KEY_STEP_SASCORE_THRESHOLD = 0.658
+KEY_STEP_SPS_THRESHOLD = 160.0
+
+
+def _longest_linear_step_indices(steps: list[dict]) -> list[int]:
+    by_index = {
+        int(step.get("step_index")): step
+        for step in steps
+        if step.get("step_index") is not None
+    }
+    if not by_index:
+        return []
+    child_indices = {
+        int(child)
+        for step in by_index.values()
+        for child in step.get("precursor_steps") or []
+        if int(child) in by_index
+    }
+    if not child_indices and len(by_index) > 1:
+        return [int(step["step_index"]) for step in steps if step.get("step_index") is not None]
+    roots = [index for index in by_index if index not in child_indices] or list(by_index)
+    memo = {}
+
+    def longest_from(index):
+        if index in memo:
+            return memo[index]
+        children = [
+            int(child) for child in by_index[index].get("precursor_steps") or []
+            if int(child) in by_index
+        ]
+        path = [index]
+        if children:
+            child_paths = [longest_from(child) for child in children]
+            path += min(
+                child_paths,
+                key=lambda candidate: (-len(candidate), candidate),
+            )
+        memo[index] = path
+        return path
+
+    candidates = [longest_from(root) for root in roots]
+    return min(candidates, key=lambda candidate: (-len(candidate), candidate)) if candidates else []
+
+
+def _organic_reaction_endpoints(forward_smiles: str) -> tuple[str, str]:
+    parts = (forward_smiles or "").split(">>")
+    if len(parts) != 2:
+        return "", ""
+
+    def primary(side):
+        molecules = []
+        for token in side.split("."):
+            mol = Chem.MolFromSmiles(token.strip())
+            if mol is not None and any(atom.GetAtomicNum() == 6 for atom in mol.GetAtoms()):
+                molecules.append(mol)
+        if not molecules:
+            return ""
+        return _canonical_molecule_smiles(max(molecules, key=lambda mol: mol.GetNumHeavyAtoms()))
+
+    return primary(parts[0]), primary(parts[1])
+
+
+def detect_unproductive_loops(steps: list[dict]) -> list[dict]:
+    """Detect adjacent reversible protection or esterification/hydrolysis pairs."""
+    by_index = {int(step["step_index"]): step for step in steps if step.get("step_index") is not None}
+    pairs = [
+        (int(step["step_index"]), int(child))
+        for step in steps
+        if step.get("step_index") is not None
+        for child in step.get("precursor_steps") or []
+        if int(child) in by_index
+    ]
+    if not pairs:
+        lls = _longest_linear_step_indices(steps)
+        pairs = list(zip(lls, lls[1:]))
+    loops = []
+    seen_pairs = set()
+    for left_index, right_index in pairs:
+        pair = (left_index, right_index)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        left, right = by_index[left_index], by_index[right_index]
+        left_role, _ = classify_step_strategy_role(
+            left.get("reaction_name", ""),
+            left.get("typical_conditions", ""),
+            left.get("forward_smiles", ""),
+        )
+        right_role, _ = classify_step_strategy_role(
+            right.get("reaction_name", ""),
+            right.get("typical_conditions", ""),
+            right.get("forward_smiles", ""),
+        )
+        left_text = f"{left.get('reaction_name', '')} {left.get('typical_conditions', '')}".casefold()
+        right_text = f"{right.get('reaction_name', '')} {right.get('typical_conditions', '')}".casefold()
+        left_reactant, left_product = _organic_reaction_endpoints(left.get("forward_smiles", ""))
+        right_reactant, right_product = _organic_reaction_endpoints(right.get("forward_smiles", ""))
+        returns_to_intermediate = bool(
+            left_reactant
+            and left_product
+            and right_reactant
+            and right_product
+            and left_reactant == right_product
+            and left_product == right_reactant
+        )
+        protection_loop = (
+            "deprotection" in {left_role, right_role}
+            and bool({left_role, right_role} & {"protection", "protecting_acetal"})
+            and returns_to_intermediate
+        )
+        ester_loop = (
+            (("esterification" in left_text or "ester formation" in left_text) and "hydrolysis" in right_text)
+            or (("esterification" in right_text or "ester formation" in right_text) and "hydrolysis" in left_text)
+        )
+        if protection_loop or (ester_loop and returns_to_intermediate):
+            loops.append({
+                "type": "protection_deprotection_loop" if protection_loop else "esterification_hydrolysis_loop",
+                "step_indices": [left_index, right_index],
+                "returns_to_intermediate": returns_to_intermediate,
+            })
+    return loops
+
+
+def annotate_route_strategy(route: dict) -> dict:
+    """Attach LLS complexity jumps, key-step tags, and loop penalties to a route."""
+    steps = route.get("steps", [])
+    lls_indices = _longest_linear_step_indices(steps)
+    lls_set = set(lls_indices)
+    profile = []
+    for step in steps:
+        role, exclusion = classify_step_strategy_role(
+            step.get("reaction_name", step.get("strategy_role", "")),
+            step.get("typical_conditions", ""),
+            step.get("forward_smiles", ""),
+        )
+        metrics = rdkit_reaction_complexity(step.get("forward_smiles", ""))
+        delta_sascore = metrics.get("delta_sascore")
+        delta_sps = metrics.get("delta_sps")
+        eligible = not exclusion and step.get("key_step_eligible", True)
+        is_key = bool(
+            int(step.get("step_index")) in lls_set
+            and eligible
+            and (
+                (delta_sascore is not None and delta_sascore >= KEY_STEP_SASCORE_THRESHOLD)
+                or (delta_sps is not None and delta_sps >= KEY_STEP_SPS_THRESHOLD)
+            )
+        )
+        complexity_entry = {
+            "step_index": int(step.get("step_index", 0)),
+            "is_on_lls": int(step.get("step_index", 0)) in lls_set,
+            "strategy_role": role,
+            "key_step_eligible": eligible,
+            "key_step_exclusion": exclusion,
+            "is_strategic_key_step": is_key,
+            **metrics,
+        }
+        step.update({
+            "strategy_role": role,
+            "key_step_eligible": eligible,
+            "key_step_exclusion": exclusion,
+            "is_strategic_key_step": is_key,
+            "complexity": metrics,
+        })
+        profile.append(complexity_entry)
+    profile.sort(key=lambda item: item["step_index"])
+    loops = detect_unproductive_loops(steps)
+    key_steps = [entry for entry in profile if entry["is_strategic_key_step"]]
+    lls_profile = [entry for entry in profile if entry["is_on_lls"]]
+    strengths = []
+    for entry in key_steps:
+        strengths.append(max(
+            max(0.0, (entry["delta_sascore"] or 0.0) / KEY_STEP_SASCORE_THRESHOLD),
+            max(0.0, (entry["delta_sps"] or 0.0) / KEY_STEP_SPS_THRESHOLD),
+        ))
+    route.update({
+        "lls_step_indices": lls_indices,
+        "lls_length": len(lls_indices),
+        "strategic_key_step_indices": [entry["step_index"] for entry in key_steps],
+        "strategic_key_step_count": len(key_steps),
+        "complexity_building_score": round(
+            min(1.0, sum(min(1.0, strength) for strength in strengths) / max(1, len(lls_profile))),
+            4,
+        ),
+        "complexity_profile": profile,
+        "lls_complexity_profile": lls_profile,
+        "unproductive_loops": loops,
+        "unproductive_loop_count": len(loops),
+    })
+    return route
 
 
 def deduplicate_retro_state(results_dict: dict) -> dict:
@@ -53,6 +245,8 @@ def compute_composite_route_score(route: dict, ranking_mode: str = "balanced") -
 
     risk_pen = min(0.35, int(route.get("selectivity_risk_count", 0)) * 0.07)
     hte_fail_pen = min(0.20, float(route.get("ord_max_hte_fail_pct", 0.0)) / 100.0 * 0.25)
+    loop_pen = min(0.24, int(route.get("unproductive_loop_count", 0)) * 0.08)
+    complexity = min(1.0, float(route.get("complexity_building_score", 0.0)))
 
     if ranking_mode == "medchem_fast":
         raw = 0.28 * state_s + 0.35 * step_score + 0.17 * stock_ratio + 0.15 * ord_blend + 0.05 * safe_s
@@ -60,9 +254,18 @@ def compute_composite_route_score(route: dict, ranking_mode: str = "balanced") -
         raw = 0.22 * state_s + 0.13 * step_score + 0.25 * stock_ratio + 0.20 * ord_blend + 0.20 * safe_s
     elif ranking_mode == "green_safe":
         raw = 0.20 * state_s + 0.12 * step_score + 0.18 * stock_ratio + 0.15 * ord_blend + 0.35 * safe_s
+    elif ranking_mode in {"strategy_complexity", "strategy", "complexity_building"}:
+        raw = (
+            0.12 * state_s
+            + 0.10 * step_score
+            + 0.08 * stock_ratio
+            + 0.20 * ord_blend
+            + 0.10 * safe_s
+            + 0.40 * complexity
+        )
     else:
         raw = 0.25 * state_s + 0.15 * step_score + 0.15 * stock_ratio + 0.35 * ord_blend + 0.10 * safe_s
-    return round(max(0.0, raw - risk_pen - hte_fail_pen), 4)
+    return round(max(0.0, raw - risk_pen - hte_fail_pen - loop_pen), 4)
 
 
 def run_retrosynthesis_pipeline(
@@ -100,6 +303,7 @@ def run_retrosynthesis_pipeline(
     if ord_validator is None:
         ord_validator = get_ord_validator()
     cleanup_aizynth_memory(finder, trim_ipython_history=False, state=state)
+    configure_finder_runtime_stock(finder, state=state)
 
     cfg = finder.config.search
     if "retro" in (search_algorithm or "").lower():
@@ -178,8 +382,15 @@ def run_retrosynthesis_pipeline(
                 l_smi = leaf.smiles
                 l_mol = Chem.MolFromSmiles(l_smi)
                 ikey = Chem.MolToInchiKey(l_mol) if l_mol else ""
+                common_reagent = (
+                    bool(state.retro_search_params.get("use_common_lab_reagents", True))
+                    and is_common_lab_reagent(l_smi)
+                )
                 if l_smi in state.custom_lab_stock_smiles or (ikey and ikey in state.custom_lab_stock_inchikeys):
                     src, tier = "Lab Stock", "$0 On-Shelf"
+                    in_stock_cnt += 1
+                elif common_reagent:
+                    src, tier = "Common Lab Reagent", "$0 Allowlist"
                     in_stock_cnt += 1
                 elif rxn_tree.in_stock(leaf):
                     src, tier = "ZINC Stock", "Commercial"
@@ -188,7 +399,11 @@ def run_retrosynthesis_pipeline(
                     src, tier = "Not in Stock", "Custom Synthesis"
                 precursors.append({"smiles": l_smi, "source": src, "cost_tier": tier})
             avg_safe = sum(s["safety_green_score"] for s in steps_data) / max(1, len(steps_data))
-            risk_cnt = sum(1 for s in steps_data if s["selectivity_warning"] != "None")
+            risk_cnt = sum(
+                1 for s in steps_data
+                if s.get("selectivity_warning", "None") != "None"
+                or s.get("stereochemical_control_risk", "None") != "None"
+            )
             route_entry = {
                 "is_solved": bool(rxn_tree.is_solved) or (in_stock_cnt == len(precursors)),
                 "state_score": round(state_score, 4),
@@ -209,6 +424,7 @@ def run_retrosynthesis_pipeline(
                 },
                 "steps": steps_data,
             }
+            annotate_route_strategy(route_entry)
             route_entry["composite_score"] = compute_composite_route_score(route_entry, ranking_mode)
             route_entry["score"] = route_entry["composite_score"]
             processed_routes.append(route_entry)
