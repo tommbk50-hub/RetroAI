@@ -25,6 +25,21 @@ _COMPETING_ELECTROPHILES = frozenset({
     "fr_anhydride", "fr_acyl_halide", "fr_isocyan", "RDKitFG_Anhydride", "RDKitFG_AcidChloride",
 })
 _POPCOUNT_UINT8 = np.fromiter((value.bit_count() for value in range(256)), dtype=np.uint8, count=256)
+_SPECTATOR_FG_SMARTS = (
+    ("silyl_ether", "[Si][O]"),
+    ("boc_protected_amine", "[NX3][C](=O)O[#6]([#6])([#6])[#6]"),
+    ("cbz_protected_amine", "[NX3][C](=O)O[CH2]c"),
+    ("acetal_ketal", "[#6X4]([OX2])[OX2]"),
+    ("epoxide", "[C;r3]1[O;r3][C;r3]1"),
+    ("alkene", "[#6;!$([#6]=O);!a]=[#6;!a]"),
+    ("alkyne", "[#6]#[#6]"),
+    ("indole", "[nH]1ccc2ccccc21"),
+    ("ester", "[CX3](=[OX1])[OX2][#6]"),
+    ("ketone", "[#6][CX3](=[OX1])[#6]"),
+    ("aldehyde", "[CX3H1](=[OX1])[#6]"),
+    ("unprotected_oh", "[OX2H]"),
+    ("unprotected_nh", "[NX3;H1,H2]"),
+)
 
 
 def compute_folded_rxn_fp(rxn_smiles: str, n_bits: int = 2048) -> Optional[bytes]:
@@ -191,6 +206,34 @@ def compute_rdkit_internal_delta_fg(rxn_smiles):
 
     before, after = count(reactants), count(products)
     return before - after, after - before, before.copy()
+
+
+@functools.lru_cache(maxsize=4096)
+def compute_spectator_functional_groups(rxn_smiles):
+    """Count selected groups on each side and the groups that survive intact."""
+    reactants, products = _parse_reaction_mols(rxn_smiles)
+    if not reactants or not products:
+        return {"reactant": {}, "product": {}, "survived": {}}
+    queries = tuple(
+        (name, query)
+        for name, smarts in _SPECTATOR_FG_SMARTS
+        if (query := Chem.MolFromSmarts(smarts)) is not None
+    )
+
+    def count_side(mols):
+        counts = Counter()
+        for mol in mols:
+            for name, query in queries:
+                counts[name] += len(mol.GetSubstructMatches(query, uniquify=True))
+        return counts
+
+    reactant, product = count_side(reactants), count_side(products)
+    survived = reactant & product
+    return {
+        "reactant": dict(sorted(reactant.items())),
+        "product": dict(sorted(product.items())),
+        "survived": dict(sorted(survived.items())),
+    }
 
 
 @functools.lru_cache(maxsize=128)

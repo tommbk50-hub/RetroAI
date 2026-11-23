@@ -42,6 +42,26 @@ class ReagentStoichItem(BaseModel):
     molarity_m: float = Field(ge=0, allow_inf_nan=False)
 
 
+class CbyDPrecedent(BaseModel):
+    reaction_id: str
+    similarity: float = Field(ge=0, le=1)
+    catalysts: List[str] = Field(default_factory=list)
+    ligands: List[str] = Field(default_factory=list)
+    solvents: List[str] = Field(default_factory=list)
+    modifiers: List[str] = Field(default_factory=list)
+    temperature: List[str] = Field(default_factory=list)
+    yield_pct: float | None = None
+    yield_raw: str = ""
+    step_count: int = Field(default=1, ge=1)
+    is_borsm: bool = False
+    dr: str = ""
+    ee: str = ""
+    er: str = ""
+    doi: str = ""
+    citation: str = ""
+    tolerated_functional_groups: List[str] = Field(default_factory=list)
+
+
 class StepClassificationItem(BaseModel):
     forward_smiles: str
     reaction_name: str
@@ -54,6 +74,10 @@ class StepClassificationItem(BaseModel):
     source_doi_or_patent: str = ""
     typical_conditions: str = ""
     assumed_step_yield: float | None = Field(default=None, ge=0, le=1)
+    cbyd_precedents: List[CbyDPrecedent] = Field(default_factory=list)
+    hazard_flags: List[str] = Field(default_factory=list)
+    safer_alternatives: List[str] = Field(default_factory=list)
+    data_gap_warnings: List[str] = Field(default_factory=list)
 
     @field_validator("safety_green_score", mode="before")
     @classmethod

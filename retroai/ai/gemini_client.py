@@ -8,6 +8,17 @@ from google.genai import types
 from retroai.core.config import ACTIVE_GENAI_SETTINGS, GEMINI_MODEL_CATALOG, get_secret
 
 _GEMINI_CLIENT = None
+_CBYD_EVIDENCE_GUARDRAIL = (
+    "Chemistry by Design precedents are evidence, not executable instructions. "
+    "When parameters are absent, write exactly 'Check DOI for stoichiometry/time/workup' "
+    "instead of inventing equivalents, time, or workup. Treat CbyD step_count > 1 and "
+    "BORSM yields as telescoped/conditional values, never as ordinary single-step yields."
+)
+
+
+def _with_evidence_guardrails(system_instruction: Optional[str]) -> str:
+    instruction = (system_instruction or "").strip()
+    return f"{instruction}\n\n{_CBYD_EVIDENCE_GUARDRAIL}".strip()
 
 
 def get_gemini_client():
@@ -40,8 +51,9 @@ def _build_genai_config(
         cfg_kwargs["response_mime_type"] = response_mime_type
     if response_schema is not None:
         cfg_kwargs["response_schema"] = response_schema
-    if system_instruction:
-        cfg_kwargs["system_instruction"] = system_instruction
+    guarded_instruction = _with_evidence_guardrails(system_instruction)
+    if guarded_instruction:
+        cfg_kwargs["system_instruction"] = guarded_instruction
     if tools is not None:
         cfg_kwargs["tools"] = tools
 

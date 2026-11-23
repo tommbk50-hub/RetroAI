@@ -24,7 +24,7 @@ from retroai.ai.classifier import (
     rdkit_classify_step,
 )
 from retroai.ai.gemini_client import call_gemini_with_config, get_gemini_client
-from retroai.ai.literature import _clean_doi, _verify_doi_metadata
+from retroai.ai.literature import _clean_doi, _verify_doi_metadata, cbyd_precedent_literature
 from retroai.core.chem_utils import (
     _canonical_molecule_smiles,
     _compute_descriptors_and_ro5,
@@ -301,10 +301,10 @@ def _render_ord_step_panel_html(ov: dict, verified_literature=()) -> str:
     badges = (
         f"<span class='cf-metric-pill'>Matched SMARTS Tier: {html.escape(tier)}</span>"
         f"<span class='cf-metric-pill' title='{html.escape(full_delta)}'>RDKit ΔFG Signature: {html.escape(short_lost)} → {html.escape(short_gained)}</span>"
-        f"<span class='cf-metric-pill'>SMARTS-Verified ORD Hits: {int(count or 0)}</span>"
+        f"<span class='cf-metric-pill'>SMARTS-Verified Precedent Hits: {int(count or 0)}</span>"
     )
     if not count:
-        message = ("0 ORD reactions in current shard matched this Reaction SMARTS / ΔFG gate — using USPTO Template + RDKit ΔFG conditions"
+        message = ("0 ORD/CbyD reactions in the local indexes matched this Reaction SMARTS / ΔFG gate — using USPTO Template + RDKit ΔFG conditions"
                    if count == 0 else "This route has no gated ORD report. Reclassify it to verify precedents.")
         return f"<div class='cf-step-section'>{badges}<div class='cf-metric-pill'>{message}</div></div>"
 
@@ -328,11 +328,11 @@ def _render_ord_step_panel_html(ov: dict, verified_literature=()) -> str:
     prec_cards = []
     for p in ov.get("top_precedents", []):
         oid = p.get("ord_id", "ord")
-        oid_html = _render_step_source(oid, {oid}, ())
+        oid_html = _render_step_source(oid, {oid} if p.get("provider") != "CbyD" else set(), ())
         sim = p.get("similarity", 0.0)
         y_str = f"{p['yield_pct']:.0f}%" if p.get("yield_pct") is not None else "N/A"
         doi = _clean_doi(p.get("doi") or "")
-        reference = doi if any(doi.lower() == work["doi"].lower() for work in verified_literature) else p.get("patent_id")
+        reference = doi if (p.get("provider") == "CbyD" or any(doi.lower() == work["doi"].lower() for work in verified_literature)) else p.get("patent_id")
         ref_html = _render_step_source(reference, (), verified_literature)
 
         cond_bits = []
@@ -342,8 +342,16 @@ def _render_ord_step_panel_html(ov: dict, verified_literature=()) -> str:
             cond_bits.append(f"Reag: {html.escape(p['reagents'])}")
         if p.get("solvents") and p["solvents"] != "Unspecified":
             cond_bits.append(f"Solv: {html.escape(p['solvents'])}")
+        if p.get("step_count", 1) > 1:
+            cond_bits.append(f"⚠ telescoped {int(p['step_count'])}-step yield")
+        if p.get("is_borsm"):
+            cond_bits.append("⚠ BORSM")
         if p.get("temp_c") is not None:
             cond_bits.append(f"{p['temp_c']:.0f} °C")
+        elif p.get("temperature"):
+            cond_bits.append(html.escape(str(p["temperature"])))
+        if p.get("hazard_flags"):
+            cond_bits.append("⚠ " + html.escape("; ".join(p["hazard_flags"])))
         cond_summary = " · ".join(cond_bits) if cond_bits else "Conditions unspecified"
 
         rxn_smi = (p.get("rxn_smiles") or "").strip()
@@ -371,13 +379,13 @@ def _render_ord_step_panel_html(ov: dict, verified_literature=()) -> str:
     return (
         f"<div style='margin-top:6px;padding:7px 9px;background:#f0fdfa;border-left:3px solid #0d9488;border-radius:4px;font-size:11px;color:#1e293b;'>"
         f"<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;'>"
-        f"<span style='font-weight:700;color:#0f766e;'>🔬 ORD Step Validation (Verified Exact Product Hits: {exact_hits} · Gated similarity: {max_sim:.2f})</span>"
+        f"<span style='font-weight:700;color:#0f766e;'>🔬 ORD + CbyD Step Validation (Verified Exact Product Hits: {exact_hits} · Gated similarity: {max_sim:.2f})</span>"
         f"<span style='display:flex;gap:6px;align-items:center;'>"
         f"{fail_badge}"
         f"<span style='background:#e0f2fe;color:{conf_color};padding:1px 7px;border-radius:4px;font-weight:700;'>Step S_ORD: {step_conf:.2f}</span>"
         f"</span></div>"
         f"<div class='cf-pill-grid'>{badges}</div>"
-        f"<div style='margin-top:4px;'><b>ORD Forward Grounded Conditions:</b> {html.escape(grounded_cond)} · <b>Analog Mean Yield:</b> {yield_str}</div>"
+        f"<div style='margin-top:4px;'><b>Evidence-Grounded Forward Conditions:</b> {html.escape(grounded_cond)} · <b>Analog Mean Yield:</b> {yield_str}</div>"
         f"<div style='margin-top:4px;'>{''.join(prec_cards)}</div>"
         f"</div>"
     )
@@ -396,8 +404,17 @@ def _render_ranked_conditions_html(step):
         source = _render_step_source(cond.get("citation_or_ord_id"), ord_ids, verified)
         cards.append(f"<div class='cf-condition-card'><b>Rank #{int(cond['rank'])}: {html.escape(cond['condition_label'])}</b>"
                      f"{parts}<div><b>Source:</b> {source or 'Not established'}</div></div>")
+    hazard_flags = list(step.get("hazard_flags") or [])
+    data_gaps = list(step.get("data_gap_warnings") or [])
+    warning = ""
+    if hazard_flags or data_gaps:
+        warnings = hazard_flags + data_gaps
+        warning = (
+            "<div style='margin-bottom:5px;padding:5px 7px;background:#fff7ed;color:#9a3412;border-radius:4px;'>"
+            f"<b>Human review:</b> {' · '.join(html.escape(item) for item in warnings)}</div>"
+        )
     return (f"<details class='cf-step-section'><summary>Ranked reaction conditions ({len(cards)})</summary>"
-            f"{''.join(cards)}</details>") if cards else ""
+            f"{warning}{''.join(cards)}</details>") if cards else warning
 
 
 def _render_step_analytics_html(forward_smiles):
@@ -1861,7 +1878,7 @@ class _Workbench:
         used_m = cls.get("step_genai_model") or "RDKit"
         return IPython.display.JSON({"html": f"""
     <div class="cf-route-card">
-      <div style="font-size:10px;font-weight:700;color:#0284c7;margin-bottom:4px;">REACTION ANALYSIS + ORD VALIDATION · {html.escape(used_m.upper())}</div>
+      <div style="font-size:10px;font-weight:700;color:#0284c7;margin-bottom:4px;">REACTION ANALYSIS + ORD/CBYD VALIDATION · {html.escape(used_m.upper())}</div>
       <div class="cf-step-box">{svg}</div>
       {ord_panel}
       <div style="margin-top:8px;font-size:12px;">
@@ -2037,7 +2054,14 @@ class _Workbench:
             svg_card = mol_or_rxn_to_svg_html(forward_reaction_smiles, width=440, height=115, label="Inspected Reaction Step")
             ord_rep = self.ord_validator.validate_step(forward_reaction_smiles, template_info=template)
             hits = ord_rep.get("top_precedents", []) if ord_rep.get("smarts_matched_count") else []
-            verified_literature = [work for hit in hits if (work := _verify_doi_metadata(hit.get("doi") or ""))]
+            verified_literature = [
+                work for hit in hits
+                if (work := (
+                    cbyd_precedent_literature(hit)
+                    if hit.get("provider") == "CbyD"
+                    else _verify_doi_metadata(hit.get("doi") or "")
+                ))
+            ]
             ord_card = _render_ord_step_panel_html(ord_rep, verified_literature)
             tool_artifacts_html.append(f"<div style='margin-top:6px;'>{svg_card}{ord_card}</div>")
             return json.dumps({
@@ -2058,10 +2082,13 @@ class _Workbench:
             "You are an expert Medicinal & Process Organic Chemist AI Agent integrated into the ChemForge Workbench.\n"
             "You have full access to the active AiZynthFinder retrosynthesis routes, Route-Level ORD Empirical Confidence Scores (S_ORD), "
             "step-level ORD precedent matches, HTE negative-data failure rates (<15% yield), grounded ORD conditions/DOIs, "
+            "and optional Chemistry by Design (CbyD) peer-reviewed precedents, functional-group tolerance, and hazard flags, "
             "starting material stock status, and RDKit tools.\n"
             "When the user asks to re-run a search with new constraints (e.g., excluding Pd/Stille/azides, fewer steps, green or evidence mode), "
             "call `rerun_retrosynthesis_with_constraints`. When asked for stoichiometry or scale-up quantities, call `build_scaled_eln_table`. "
             "When asked about ORD precedents, impurities, LC-MS ions, or workup for a specific reaction step, call `inspect_reaction_step_details`.\n"
+            "For CbyD precedents, never invent stoichiometry, time, or workup: state 'Check DOI for stoichiometry/time/workup'. "
+            "Surface telescoped/multi-step and BORSM yields as non-single-step evidence.\n"
             "Format your response in clean HTML using <b>, <ul>, <li>, <code>, and concise paragraphs."
         )
         prompt = f"CURRENT RETROSYNTHESIS + ORD VALIDATION SESSION CONTEXT:\n{retro_ctx}\n\nRECENT CONVERSATION HISTORY:\n{history_text}\n\nUSER QUESTION:\n{msg}"
