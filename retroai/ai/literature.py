@@ -17,6 +17,19 @@ def _literature_snippet(text, limit=600):
     return " ".join(re.sub(r"<[^>]*>", " ", html.unescape(text or "")).split())[:limit]
 
 
+def cbyd_precedent_literature(precedent):
+    """Preserve CbyD's curated DOI/citation attribution without live network verification."""
+    doi = _clean_doi(precedent.get("doi") or "")
+    if not doi:
+        return None
+    return {
+        "doi": doi,
+        "title": _literature_snippet(precedent.get("citation") or "Chemistry by Design precedent"),
+        "snippet": _literature_snippet(precedent.get("citation")),
+        "source": "Chemistry by Design (CC BY 4.0)",
+    }
+
+
 @functools.lru_cache(maxsize=256)
 def _verify_doi_metadata(value):
     doi = _clean_doi(value)

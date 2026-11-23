@@ -14,10 +14,8 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 
 from retroai.core.chem_utils import _extract_primary_smiles
 
-try:
-    from drfp import DrfpEncoder
-except ImportError:  # DRFP is optional only for lightweight/offline development imports.
-    DrfpEncoder = None
+DrfpEncoder = None
+_DRFP_IMPORT_ATTEMPTED = False
 
 
 _SMARTSRX_URL = "https://raw.githubusercontent.com/MolecularAI/smartsrx/main/smartsrx.json"
@@ -25,6 +23,21 @@ _COMPETING_ELECTROPHILES = frozenset({
     "fr_anhydride", "fr_acyl_halide", "fr_isocyan", "RDKitFG_Anhydride", "RDKitFG_AcidChloride",
 })
 _POPCOUNT_UINT8 = np.fromiter((value.bit_count() for value in range(256)), dtype=np.uint8, count=256)
+_SPECTATOR_FG_SMARTS = (
+    ("silyl_ether", "[Si][O]"),
+    ("boc_protected_amine", "[NX3][C](=O)O[#6]([#6])([#6])[#6]"),
+    ("cbz_protected_amine", "[NX3][C](=O)O[CH2]c"),
+    ("acetal_ketal", "[#6X4]([OX2])[OX2]"),
+    ("epoxide", "[C;r3]1[O;r3][C;r3]1"),
+    ("alkene", "[#6;!$([#6]=O);!a]=[#6;!a]"),
+    ("alkyne", "[#6]#[#6]"),
+    ("indole", "[nH]1ccc2ccccc21"),
+    ("ester", "[CX3](=[OX1])[OX2][#6]"),
+    ("ketone", "[#6][CX3](=[OX1])[#6]"),
+    ("aldehyde", "[CX3H1](=[OX1])[#6]"),
+    ("unprotected_oh", "[OX2H]"),
+    ("unprotected_nh", "[NX3;H1,H2]"),
+)
 
 
 def compute_folded_rxn_fp(rxn_smiles: str, n_bits: int = 2048) -> Optional[bytes]:
@@ -55,6 +68,14 @@ def compute_folded_rxn_fp(rxn_smiles: str, n_bits: int = 2048) -> Optional[bytes
 
 def compute_drfp_bytes(rxn_smiles: str, n_bits: int = 2048, radius: int = 3) -> Optional[bytes]:
     """Compute a packed DRFP reaction fingerprint, or return ``None`` when unavailable."""
+    global DrfpEncoder, _DRFP_IMPORT_ATTEMPTED
+    if not _DRFP_IMPORT_ATTEMPTED:
+        _DRFP_IMPORT_ATTEMPTED = True
+        try:
+            from drfp import DrfpEncoder as encoder
+        except ImportError:
+            encoder = None
+        DrfpEncoder = encoder
     if DrfpEncoder is None or n_bits <= 0 or n_bits % 8:
         return None
     try:
@@ -191,6 +212,57 @@ def compute_rdkit_internal_delta_fg(rxn_smiles):
 
     before, after = count(reactants), count(products)
     return before - after, after - before, before.copy()
+
+
+@functools.lru_cache(maxsize=4096)
+def compute_spectator_functional_groups(rxn_smiles):
+    """Count groups and, for mapped reactions, identify exact mapped survival."""
+    reactants, products = _parse_reaction_mols(rxn_smiles)
+    if not reactants or not products:
+        return {"reactant": {}, "product": {}, "survived": {}}
+    queries = tuple(
+        (name, query)
+        for name, smarts in _SPECTATOR_FG_SMARTS
+        if (query := Chem.MolFromSmarts(smarts)) is not None
+    )
+
+    def occurrences(mols):
+        counts, mapped = Counter(), defaultdict(list)
+        for mol in mols:
+            for name, query in queries:
+                matches = mol.GetSubstructMatches(query, uniquify=True)
+                if matches:
+                    counts[name] += len(matches)
+                for match in matches:
+                    map_set = frozenset(
+                        mol.GetAtomWithIdx(idx).GetAtomMapNum()
+                        for idx in match
+                        if mol.GetAtomWithIdx(idx).GetAtomMapNum()
+                    )
+                    if map_set and len(map_set) == len(match):
+                        mapped[name].append(map_set)
+        return counts, mapped
+
+    reactant, reactant_mapped = occurrences(reactants)
+    product, product_mapped = occurrences(products)
+    surviving_counts = Counter()
+    has_mapping = any(reactant_mapped.values()) and any(product_mapped.values())
+    if has_mapping:
+        for name in reactant_mapped:
+            remaining = Counter(product_mapped.get(name, ()))
+            for atom_maps in reactant_mapped[name]:
+                if remaining[atom_maps]:
+                    surviving_counts[name] += 1
+                    remaining[atom_maps] -= 1
+    else:
+        # Unmapped user reactions cannot prove atom identity; use class overlap only as
+        # a lower-confidence audit signal while mapped precedents use exact atom maps.
+        surviving_counts = reactant & product
+    return {
+        "reactant": dict(sorted(reactant.items())),
+        "product": dict(sorted(product.items())),
+        "survived": dict(sorted(surviving_counts.items())),
+    }
 
 
 @functools.lru_cache(maxsize=128)

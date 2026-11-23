@@ -35,6 +35,7 @@ from .fingerprints import (
     compute_folded_rxn_fp,
     compute_rdkit_internal_delta_fg,
     compute_rxn_center_diff_fp,
+    compute_spectator_functional_groups,
     matches_reaction_smarts_mols,
     tanimoto_packed_fp_batch,
 )
@@ -73,6 +74,14 @@ def _counter_from_json(value) -> Counter:
 
 def _delta_cache_key(delta) -> tuple:
     return tuple(tuple(sorted(Counter(groups).items())) for groups in delta[:2])
+
+
+def _json_value(value, fallback):
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+        return parsed if isinstance(parsed, type(fallback)) else fallback
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return fallback
 
 
 def _submit_and_poll_ord_session(
@@ -291,6 +300,18 @@ class ORDRetrosynthesisValidator:
             rows = con.execute(
                 "SELECT ord_id, drfp_bytes FROM ord_reactions WHERE drfp_bytes IS NOT NULL ORDER BY ord_id"
             ).fetchall()
+            has_cbyd = con.execute(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = 'cbyd_reactions'"
+            ).fetchone()[0] > 0
+            if has_cbyd:
+                self._cbyd_index_size = con.execute("SELECT count(*) FROM cbyd_reactions").fetchone()[0]
+                cbyd_rows = con.execute(
+                    "SELECT reaction_id, drfp_bytes FROM cbyd_reactions "
+                    "WHERE drfp_bytes IS NOT NULL ORDER BY reaction_id"
+                ).fetchall()
+            else:
+                self._cbyd_index_size = 0
+                cbyd_rows = []
         indexed = [
             (ord_id, np.frombuffer(bytes(fingerprint), dtype=np.uint8).copy())
             for ord_id, fingerprint in rows
@@ -302,11 +323,107 @@ class ORDRetrosynthesisValidator:
             if indexed
             else np.empty((0, 256), dtype=np.uint8)
         )
+        cbyd_indexed = [
+            (reaction_id, np.frombuffer(bytes(fingerprint), dtype=np.uint8).copy())
+            for reaction_id, fingerprint in cbyd_rows
+            if fingerprint and len(fingerprint) == 256
+        ]
+        self._drfp_cbyd_ids = np.asarray([reaction_id for reaction_id, _ in cbyd_indexed], dtype=object)
+        self._drfp_cbyd_matrix = (
+            np.stack([fingerprint for _, fingerprint in cbyd_indexed]).astype(np.uint8, copy=False)
+            if cbyd_indexed
+            else np.empty((0, 256), dtype=np.uint8)
+        )
         self.index_revision += 1
         self._validate_cached.cache_clear()
 
     def get_index_size(self) -> int:
         return self._index_size
+
+    def get_cbyd_index_size(self) -> int:
+        return self._cbyd_index_size
+
+    def _query_cbyd_precedents(
+        self, s, prod_conn, tiers, delta, query_drfp, query_bits, *, top_k=50
+    ) -> tuple[list, int]:
+        """Retrieve and chemically gate CbyD candidates, then rerank by spectator overlap."""
+        if not self._cbyd_index_size:
+            return [], 0
+        candidate_ids, similarities = set(), {}
+        with duckdb.connect(self.db_path, read_only=True) as con:
+            exact_ids = set()
+            if prod_conn:
+                exact_ids = {
+                    row[0] for row in con.execute(
+                        "SELECT reaction_id FROM cbyd_reactions WHERE prod_connectivity = ?",
+                        [prod_conn],
+                    ).fetchall()
+                }
+                candidate_ids.update(exact_ids)
+            if self._cbyd_index_size <= 300:
+                candidate_ids.update(row[0] for row in con.execute(
+                    "SELECT reaction_id FROM cbyd_reactions"
+                ).fetchall())
+            elif query_drfp and self._drfp_cbyd_matrix.size:
+                scores = tanimoto_packed_fp_batch(query_drfp, self._drfp_cbyd_matrix)
+                eligible = np.flatnonzero(scores >= 0.10)
+                ranked = sorted(eligible, key=lambda idx: (-float(scores[idx]), str(self._drfp_cbyd_ids[idx])))[:200]
+                for idx in ranked:
+                    reaction_id = str(self._drfp_cbyd_ids[idx])
+                    candidate_ids.add(reaction_id)
+                    similarities[reaction_id] = float(scores[idx])
+            if not candidate_ids:
+                return [], 0
+            placeholders = ",".join("?" for _ in candidate_ids)
+            cursor = con.execute(
+                f"SELECT * FROM cbyd_reactions WHERE reaction_id IN ({placeholders})",
+                sorted(candidate_ids),
+            )
+            columns = [col[0] for col in cursor.description]
+            rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+        query_spectators = compute_spectator_functional_groups(s)
+        query_tags = set(query_spectators["survived"])
+        admitted = []
+        for rec in rows:
+            rxn = rec.get("canonical_reaction") or rec.get("rxn_smiles") or ""
+            gate = _match_ord_gate(
+                *_parse_reaction_mols(rxn),
+                (_counter_from_json(rec.get("consumed_fgs")), _counter_from_json(rec.get("formed_fgs")), Counter()),
+                tiers,
+                delta,
+            )
+            if not gate:
+                continue
+            label, base = gate
+            bits = int.from_bytes(rec.get("fp_bytes") or compute_folded_rxn_fp(rxn) or b"", "big")
+            union = (query_bits | bits).bit_count()
+            structural = (query_bits & bits).bit_count() / union if union else 0.0
+            drfp = similarities.get(rec["reaction_id"])
+            if drfp is None and query_drfp and rec.get("drfp_bytes"):
+                drfp = float(tanimoto_packed_fp_batch(
+                    query_drfp,
+                    np.frombuffer(bytes(rec["drfp_bytes"]), dtype=np.uint8).reshape(1, -1),
+                )[0])
+            drfp = drfp or 0.0
+            candidate_tags = set(_json_value(rec.get("survived_fgs"), {}))
+            overlap = len(query_tags & candidate_tags) / len(query_tags) if query_tags else 0.0
+            transformation_similarity = 0.45 * base + 0.55 * (0.50 * structural + 0.50 * drfp)
+            rec.update({
+                "ord_id": rec["reaction_id"],
+                "precedent_id": rec["reaction_id"],
+                "provider": "CbyD",
+                "provenance": "CbyD (Peer-Reviewed)",
+                "similarity": 0.85 * transformation_similarity + 0.15 * overlap,
+                "transformation_similarity": transformation_similarity,
+                "spectator_overlap": round(overlap, 3),
+                "tolerated_functional_groups": sorted(candidate_tags),
+                "matched_smarts_label": label,
+                "reagents": rec.get("general_reagents") or "None",
+            })
+            admitted.append(rec)
+        admitted.sort(key=lambda r: (-r["similarity"], r["reaction_id"]))
+        return admitted[:top_k], len(exact_ids & {r["reaction_id"] for r in admitted})
 
     def batch_prefetch_online_ord(
         self,
@@ -516,6 +633,7 @@ class ORDRetrosynthesisValidator:
         prod_conn = Chem.MolToInchiKey(primary_product).split("-")[0] if primary_product else ""
         tiers = build_progressive_reaction_smarts(s, template, mapped) if products else []
         delta = compute_rdkit_internal_delta_fg(s)
+        functional_group_audit = compute_spectator_functional_groups(s)
         matched_smarts_label, best_gate_base, exact_hits = "No verified match (Unvalidated)", 0.0, 0
         analog_records = []
         if tiers or delta[0] or delta[1]:
@@ -614,12 +732,35 @@ class ORDRetrosynthesisValidator:
                 rec.pop("fp_bytes", None)
                 rec.pop("drfp_bytes", None)
                 rec.pop("diff_fp_bytes", None)
+                rec["provider"] = "ORD"
+                rec["provenance"] = "ORD"
+                rec["precedent_id"] = rec["ord_id"]
                 analog_records.append(rec)
 
-        analog_records.sort(key=lambda x: (-x["similarity"], -(x["yield_pct"] if x["yield_pct"] is not None else -1.0), x["ord_id"]))
+            current_max = max((r["similarity"] for r in analog_records), default=0.0)
+            if current_max < 0.55 and self._cbyd_index_size:
+                cbyd_records, cbyd_exact_hits = self._query_cbyd_precedents(
+                    s, prod_conn, tiers, delta, query_drfp, q_bits, top_k=50
+                )
+                exact_hits += cbyd_exact_hits
+                analog_records.extend(cbyd_records)
 
-        reported_yields = [float(r["yield_pct"]) for r in analog_records if r.get("yield_pct") is not None and not np.isnan(r["yield_pct"])]
-        top_k_yields = [float(r["yield_pct"]) for r in analog_records[: max(3, top_k)] if r.get("yield_pct") is not None and not np.isnan(r["yield_pct"])]
+        analog_records.sort(key=lambda x: (-x["similarity"], -(x["yield_pct"] if x["yield_pct"] is not None else -1.0), x["ord_id"]))
+        if analog_records:
+            matched_smarts_label = analog_records[0]["matched_smarts_label"]
+
+        scoreable_yields = []
+        for record in analog_records:
+            value = record.get("yield_pct")
+            if value is None or np.isnan(value):
+                continue
+            if record.get("provider") == "CbyD" and (
+                int(record.get("step_count") or 1) > 1 or record.get("is_borsm")
+            ):
+                continue
+            scoreable_yields.append(record)
+        reported_yields = [float(r["yield_pct"]) for r in scoreable_yields]
+        top_k_yields = [float(r["yield_pct"]) for r in scoreable_yields[: max(3, top_k)]]
 
         mean_yield = round(float(np.mean(top_k_yields)), 1) if top_k_yields else None
         median_yield = round(float(np.median(reported_yields)), 1) if reported_yields else None
@@ -637,11 +778,11 @@ class ORDRetrosynthesisValidator:
         neg_data_warn = "None"
         if hte_fail_rate >= 30.0:
             neg_data_warn = (
-                f"ORD Negative-Data Alert: {hte_fail_rate:.0f}% of close ORD/HTE analogs reported <15% yield "
+                f"Evidence Negative-Data Alert: {hte_fail_rate:.0f}% of close analogs reported <15% yield "
                 f"(median yield {median_yield or 0:.0f}%). Inspect catalyst/base pairing carefully."
             )
         elif mean_yield is not None and mean_yield < 45.0:
-            neg_data_warn = f"Low Empirical ORD Yield: Top analogs average {mean_yield:.1f}% yield in ORD."
+            neg_data_warn = f"Low Empirical Evidence Yield: Top analogs average {mean_yield:.1f}% yield."
 
         grounded_source = analog_records[0] if analog_records else None
         for rec in analog_records[:max(1, top_k)]:
@@ -662,7 +803,11 @@ class ORDRetrosynthesisValidator:
             if grounded_source.get("atmosphere") and grounded_source["atmosphere"] not in ("UNSPECIFIED", "None"):
                 parts_cond.append(f"{grounded_source['atmosphere']}")
             grounded_conditions = ", ".join(parts_cond)
-            grounded_ref = f"{grounded_source['ord_id']} ({grounded_source.get('yield_pct', 'N/A')}% yield, {grounded_source.get('reference', '')})"
+            reference = grounded_source.get("reference") or grounded_source.get("citation") or grounded_source["provenance"]
+            grounded_ref = (
+                f"{grounded_source['ord_id']} ({grounded_source.get('yield_pct', 'N/A')}% yield, "
+                f"{grounded_source.get('provenance', 'ORD')}: {reference})"
+            )
 
         max_sim = float(analog_records[0]["similarity"]) if analog_records else 0.0
         if analog_records:
@@ -677,11 +822,17 @@ class ORDRetrosynthesisValidator:
             "is_validated": bool(analog_records),
             "exact_product_hits": exact_hits,
             "smarts_matched_count": len(analog_records),
+            "cbyd_matched_count": sum(1 for record in analog_records if record.get("provider") == "CbyD"),
             "matched_smarts_label": matched_smarts_label,
             "rdkit_delta_fg_signature": dict(zip(
                 ("consumed_fgs", "formed_fgs", "reactant_fgs"),
                 (sorted(Counter(groups).elements()) for groups in delta),
             )),
+            "functional_group_audit": {
+                "reactant_groups": sorted(functional_group_audit["reactant"]),
+                "product_groups": sorted(functional_group_audit["product"]),
+                "survived_non_reacting_groups": sorted(functional_group_audit["survived"]),
+            },
             "max_rxn_similarity": round(max_sim, 3),
             "mean_analog_yield_pct": mean_yield,
             "median_analog_yield_pct": median_yield,
@@ -694,19 +845,46 @@ class ORDRetrosynthesisValidator:
             "top_precedents": [
                 {
                     "ord_id": r["ord_id"],
+                    "precedent_id": r.get("precedent_id", r["ord_id"]),
+                    "provider": r.get("provider", "ORD"),
+                    "provenance": r.get("provenance", "ORD"),
                     "rxn_smiles": r.get("rxn_smiles", ""),
                     "similarity": round(r["similarity"], 3),
+                    "transformation_similarity": round(r.get("transformation_similarity", r["similarity"]), 3),
+                    "spectator_overlap": r.get("spectator_overlap", 0.0),
                     "matched_smarts_label": r["matched_smarts_label"],
                     "yield_pct": None if (r.get("yield_pct") is None or np.isnan(r["yield_pct"])) else round(float(r["yield_pct"]), 1),
                     "catalysts": r.get("catalysts", "None"),
                     "reagents": r.get("reagents", "None"),
                     "solvents": r.get("solvents", "Unspecified"),
+                    "ligands": r.get("ligands", ""),
+                    "modifiers": r.get("modifiers", ""),
+                    "temperature": r.get("temperature", ""),
+                    "yield_raw": r.get("yield_raw", ""),
+                    "step_count": int(r.get("step_count") or 1),
+                    "is_borsm": bool(r.get("is_borsm") or False),
+                    "dr": r.get("dr", ""),
+                    "ee": r.get("ee", ""),
+                    "er": r.get("er", ""),
+                    "tolerated_functional_groups": r.get("tolerated_functional_groups", []),
+                    "hazard_flags": _json_value(r.get("hazard_flags"), []),
+                    "safer_alternatives": _json_value(r.get("safer_alternatives"), []),
                     "temp_c": None if (r.get("temp_c") is None or np.isnan(r["temp_c"])) else round(float(r["temp_c"]), 1),
                     "atmosphere": r.get("atmosphere", "UNSPECIFIED"),
-                    "reference": r.get("reference", "ORD"),
+                    "reference": r.get("reference") or r.get("citation") or "ORD",
+                    "citation": r.get("citation", ""),
+                    "mapping_confidence": r.get("mapping_confidence"),
                     "procedure_details": r.get("procedure_details", ""),
-                    "doi": r.get("doi") or (r["reference"][5:] if (r.get("reference") or "").startswith("DOI: ") else ""),
-                    "patent_id": r.get("patent_id") or (r["reference"][8:] if (r.get("reference") or "").startswith("Patent: ") else ""),
+                    "doi": r.get("doi") or (
+                        r.get("reference", "")[5:]
+                        if (r.get("reference") or "").startswith("DOI: ")
+                        else ""
+                    ),
+                    "patent_id": r.get("patent_id") or (
+                        r.get("reference", "")[8:]
+                        if (r.get("reference") or "").startswith("Patent: ")
+                        else ""
+                    ),
                     "reagent_stoichiometry": json.loads(r.get("condition_stoichiometry") or "[]"),
                     "duration_h": r.get("duration_h"),
                 }

@@ -28,11 +28,13 @@ from pathlib import Path
 import retroai
 from retroai.core import config, state, schemas, chem_utils, resolver
 from retroai.ord import fingerprints, parser, validator
+from retroai.cbyd import parser as cbyd_parser
 from retroai.ai import gemini_client, literature, classifier
 from retroai.engine import aizynth, pipeline
 
 assert 'google.colab' not in sys.modules
 assert 'aizynthfinder' not in sys.modules
+assert 'drfp' not in sys.modules
 assert validator.get_ord_validator.cache_info().currsize == 0
 assert not Path('data').exists()
 try:
