@@ -161,7 +161,7 @@ def rdkit_classify_step(
         ranked_conditions=ranked, reagent_stoichiometry=_merge_step_stoichiometry(s, primary.get("reagent_stoichiometry", [])),
         safety_green_score=3, greener_solvent_swap="None",
         selectivity_warning=" | ".join(warnings) or "None", experimental_procedure="",
-        assumed_step_yield=_clamp_step_yield(mean / 100 if mean is not None else 0.80),
+        assumed_step_yield=_clamp_step_yield(mean / 100) if mean is not None else None,
     ).model_dump()
     _, products = _parse_reaction_mols(s)
     stereo = sum(len(Chem.FindMolChiralCenters(mol, includeUnassigned=True)) for mol in products)

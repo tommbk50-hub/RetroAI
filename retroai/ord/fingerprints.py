@@ -10,14 +10,21 @@ import numpy as np
 import requests
 from rdkit import Chem, DataStructs, RDConfig
 from rdkit.Chem import AllChem, FilterCatalog, FunctionalGroups, rdChemReactions, rdFMCS
+from rdkit.Chem.Scaffolds import MurckoScaffold
 
 from retroai.core.chem_utils import _extract_primary_smiles
+
+try:
+    from drfp import DrfpEncoder
+except ImportError:  # DRFP is optional only for lightweight/offline development imports.
+    DrfpEncoder = None
 
 
 _SMARTSRX_URL = "https://raw.githubusercontent.com/MolecularAI/smartsrx/main/smartsrx.json"
 _COMPETING_ELECTROPHILES = frozenset({
-    "fr_anhydride", "fr_acyl_halide", "fr_isocyan", "fr_COO", "RDKitFG_Anhydride", "RDKitFG_AcidChloride",
+    "fr_anhydride", "fr_acyl_halide", "fr_isocyan", "RDKitFG_Anhydride", "RDKitFG_AcidChloride",
 })
+_POPCOUNT_UINT8 = np.fromiter((value.bit_count() for value in range(256)), dtype=np.uint8, count=256)
 
 
 def compute_folded_rxn_fp(rxn_smiles: str, n_bits: int = 2048) -> Optional[bytes]:
@@ -44,6 +51,47 @@ def compute_folded_rxn_fp(rxn_smiles: str, n_bits: int = 2048) -> Optional[bytes
         return np.packbits(arr).tobytes()
     except Exception:
         return None
+
+
+def compute_drfp_bytes(rxn_smiles: str, n_bits: int = 2048, radius: int = 3) -> Optional[bytes]:
+    """Compute a packed DRFP reaction fingerprint, or return ``None`` when unavailable."""
+    if DrfpEncoder is None or n_bits <= 0 or n_bits % 8:
+        return None
+    try:
+        s = (rxn_smiles or "").strip()
+        if ">>" not in s:
+            return None
+        rxn = rdChemReactions.ReactionFromSmarts(s, useSmiles=True)
+        if not rxn or rxn.GetNumReactantTemplates() == 0 or rxn.GetNumProductTemplates() == 0:
+            return None
+        rdChemReactions.RemoveMappingNumbersFromReactions(rxn)
+        clean_rxn = rdChemReactions.ReactionToSmiles(rxn)
+        fingerprint = DrfpEncoder.encode(
+            [clean_rxn], n_folded_length=n_bits, radius=radius, rings=True
+        )[0]
+        bits = np.asarray(fingerprint, dtype=np.uint8).reshape(-1)
+        if bits.size != n_bits:
+            return None
+        return np.packbits(bits).tobytes()
+    except Exception:
+        return None
+
+
+def tanimoto_packed_fp_batch(query_bytes: bytes, matrix_u8: np.ndarray) -> np.ndarray:
+    """Vectorized Tanimoto similarities between one packed fingerprint and a byte matrix."""
+    query = np.frombuffer(query_bytes or b"", dtype=np.uint8)
+    matrix = np.asarray(matrix_u8, dtype=np.uint8)
+    if matrix.size == 0:
+        if matrix.ndim == 1:
+            matrix = matrix.reshape(0, query.size)
+        return np.empty(matrix.shape[0], dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[1] != query.size:
+        raise ValueError("matrix_u8 must have shape (N, len(query_bytes))")
+    intersections = _POPCOUNT_UINT8[np.bitwise_and(matrix, query)].sum(axis=1, dtype=np.uint32)
+    unions = _POPCOUNT_UINT8[np.bitwise_or(matrix, query)].sum(axis=1, dtype=np.uint32)
+    similarities = np.zeros(matrix.shape[0], dtype=np.float64)
+    np.divide(intersections, unions, out=similarities, where=unions != 0)
+    return similarities
 
 
 def compute_rxn_center_diff_fp(rxn_smiles: str):
@@ -122,7 +170,7 @@ def _parse_reaction_mols(rxn_smiles):
 
 @functools.lru_cache(maxsize=8192)
 def compute_rdkit_internal_delta_fg(rxn_smiles):
-    """Return immutable sets of depleted, increased, and starting functional groups."""
+    """Return multiplicity-aware depleted, increased, and starting functional groups."""
     reactants, products = _parse_reaction_mols(rxn_smiles)
     if not reactants or not products:
         return (frozenset(),) * 3
@@ -131,12 +179,18 @@ def compute_rdkit_internal_delta_fg(rxn_smiles):
     def count(mols):
         counts = Counter()
         for mol in mols:
+            seen = set()
             for match in catalog.GetFilterMatches(mol):
-                counts[match.filterMatch.GetName()] += 1
+                name = match.filterMatch.GetName()
+                if name in seen:
+                    continue
+                seen.add(name)
+                matches = match.filterMatch.GetMatches(mol)
+                counts[name] += len(matches)
         return counts
 
     before, after = count(reactants), count(products)
-    return frozenset(before - after), frozenset(after - before), frozenset(before)
+    return before - after, after - before, before.copy()
 
 
 @functools.lru_cache(maxsize=128)
@@ -157,10 +211,10 @@ def _compile_rxn_smarts_queries(rxn_smarts: str):
         return None
 
 
-def _assign_distinct_molecules(mols, queries):
+def _assign_distinct_molecules(mols, queries, use_chirality: bool = True):
     if not queries or len(queries) > len(mols):
         return False
-    edges = [[idx for idx, mol in enumerate(mols) if mol.HasSubstructMatch(query, useChirality=True)]
+    edges = [[idx for idx, mol in enumerate(mols) if mol.HasSubstructMatch(query, useChirality=use_chirality)]
              for query in queries]
     assigned = {}
 
@@ -177,14 +231,24 @@ def _assign_distinct_molecules(mols, queries):
     return all(augment(idx, set()) for idx in range(len(queries)))
 
 
-def matches_reaction_smarts_mols(rxn_reactants: List[Chem.Mol], rxn_products: List[Chem.Mol], compiled_queries) -> bool:
+def matches_reaction_smarts_mols(
+    rxn_reactants: List[Chem.Mol],
+    rxn_products: List[Chem.Mol],
+    compiled_queries,
+    use_chirality: bool = True,
+) -> bool:
     """Match distinct molecules, then require mapped SMARTS to witness the same center on both sides."""
     if not compiled_queries:
         return False
     _, r_queries, p_queries = compiled_queries
-    if not (_assign_distinct_molecules(rxn_reactants, r_queries) and _assign_distinct_molecules(rxn_products, p_queries)):
+    if not (
+        _assign_distinct_molecules(rxn_reactants, r_queries, use_chirality)
+        and _assign_distinct_molecules(rxn_products, p_queries, use_chirality)
+    ):
         return False
-    return _same_mapped_reaction_center(tuple(rxn_reactants), tuple(rxn_products), r_queries, p_queries)
+    return _same_mapped_reaction_center(
+        tuple(rxn_reactants), tuple(rxn_products), r_queries, p_queries, use_chirality
+    )
 
 
 def _atom_state(atom):
@@ -255,7 +319,7 @@ def _candidate_atom_correspondence(reactants, products):
     return product, _mcs_atom_correspondence(reactants, product)
 
 
-def _same_mapped_reaction_center(reactants, products, r_queries, p_queries):
+def _same_mapped_reaction_center(reactants, products, r_queries, p_queries, use_chirality: bool = True):
     def map_numbers(queries):
         return {a.GetAtomMapNum() for q in queries for a in q.GetAtoms()} - {0}
 
@@ -283,7 +347,9 @@ def _same_mapped_reaction_center(reactants, products, r_queries, p_queries):
             tags = [(a.GetIdx(), a.GetAtomMapNum()) for a in q.GetAtoms() if a.GetAtomMapNum() in shared]
             options = []
             for i, mol in enumerate(mols):
-                for match in mol.GetSubstructMatches(q, useChirality=True, uniquify=False, maxMatches=32):
+                for match in mol.GetSubstructMatches(
+                    q, useChirality=use_chirality, uniquify=False, maxMatches=32
+                ):
                     anchor = {tag: offsets[i] + match[j] if side else mapping.get((i, match[j])) for j, tag in tags}
                     if None not in anchor.values():
                         options.append(((side, i), anchor))
@@ -322,9 +388,13 @@ def _reaction_center_fragment(mol, center, radius, atom_maps):
     for atom in mol.GetAtoms():
         aromatic, charge, hydrogens, ring = _atom_state(atom)
         tag = f":{atom_maps[atom.GetIdx()]}" if atom.GetIdx() in atom_maps else ""
-        symbols.append(f"[#{atom.GetAtomicNum()};{'a' if aromatic else 'A'};H{hydrogens};{charge:+d};{'R' if ring else '!R'}{tag}]")
+        if atom.GetIdx() in center:
+            constraints = f";H{hydrogens};{charge:+d};{'R' if ring else '!R'}"
+        else:
+            constraints = ""
+        symbols.append(f"[#{atom.GetAtomicNum()};{'a' if aromatic else 'A'}{constraints}{tag}]")
     fragment = Chem.MolFragmentToSmiles(mol, sorted(atoms), atomSymbols=symbols,
-                                       allBondsExplicit=True, isomericSmiles=False, canonical=False)
+                                       allBondsExplicit=False, isomericSmiles=False, canonical=False)
     # A molecule can have disconnected reacting sites; keep these as one molecular query.
     return f"({fragment})" if "." in fragment else fragment
 
@@ -387,14 +457,22 @@ def _match_ord_gate(reactants, products, delta, tiers, query_delta):
         return None
     consumed, formed, _ = delta
     query_consumed, query_formed, _ = query_delta
-    if (consumed - query_consumed) & _COMPETING_ELECTROPHILES:
+    consumed, formed = Counter(consumed), Counter(formed)
+    query_consumed, query_formed = Counter(query_consumed), Counter(query_formed)
+    extra_consumed = consumed - query_consumed
+    if any(extra_consumed[name] for name in _COMPETING_ELECTROPHILES):
         return None
     for tier in tiers:
-        if matches_reaction_smarts_mols(reactants, products, tier["queries"]):
+        if matches_reaction_smarts_mols(reactants, products, tier["queries"], use_chirality=True):
             return tier["label"], tier["base_sim"]
+        if matches_reaction_smarts_mols(reactants, products, tier["queries"], use_chirality=False):
+            return f"{tier['label']} (achiral)", max(0.0, tier["base_sim"] - 0.02)
 
     def jaccard(a, b):
-        return len(a & b) / len(a | b) if a and b else 0.0
+        a, b = Counter(a), Counter(b)
+        keys = set(a) | set(b)
+        denominator = sum(max(a[key], b[key]) for key in keys)
+        return sum(min(a[key], b[key]) for key in keys) / denominator if denominator else 0.0
 
     if jaccard(query_consumed, consumed) >= 0.45 and jaccard(query_formed, formed) >= 0.45:
         return "RDKit ΔFG match", 0.58
@@ -411,10 +489,71 @@ def _rdkit_extract_reacting_cores(forward_smiles: str) -> dict:
     r_smiles = [x.strip() for x in react_s.split(".") if x.strip()]
     p_smi = _extract_primary_smiles(prod_s)
     if not r_smiles or not p_smi:
-        return {"core_reactant": "", "core_product": ""}
+        return {"core_reactant": "", "core_product": "", "core_product_scaffold": ""}
 
     r_mols = [(smi, Chem.MolFromSmiles(smi)) for smi in r_smiles]
     r_mols = [(smi, m) for smi, m in r_mols if m is not None]
     r_mols.sort(key=lambda x: x[1].GetNumHeavyAtoms(), reverse=True)
     lim_r_smi = r_mols[0][0] if r_mols else r_smiles[0]
-    return {"core_reactant": lim_r_smi, "core_product": p_smi}
+    product = Chem.MolFromSmiles(p_smi)
+    if product is None:
+        return {"core_reactant": lim_r_smi, "core_product": p_smi, "core_product_scaffold": p_smi}
+
+    canonical_product = Chem.MolToSmiles(product, canonical=True, isomericSmiles=True)
+    centers = set()
+    reactants = [mol for _, mol in r_mols]
+    if reactants:
+        try:
+            mapping = _mcs_atom_correspondence(reactants, product)
+            inverse = set(mapping.values())
+            for (reactant_idx, atom_idx), product_idx in mapping.items():
+                if _atom_changed(
+                    reactants[reactant_idx],
+                    atom_idx,
+                    product,
+                    product_idx,
+                    lambda idx: mapping.get((reactant_idx, idx)),
+                ):
+                    centers.add(product_idx)
+                    centers.update(
+                        neighbor.GetIdx()
+                        for neighbor in product.GetAtomWithIdx(product_idx).GetNeighbors()
+                        if neighbor.GetIdx() not in inverse
+                    )
+        except (ValueError, RuntimeError):
+            centers = set()
+
+    scaffold = ""
+    for radius in (3, 2):
+        atoms = set(centers)
+        for _ in range(radius):
+            atoms.update(
+                neighbor.GetIdx()
+                for atom_idx in tuple(atoms)
+                for neighbor in product.GetAtomWithIdx(atom_idx).GetNeighbors()
+            )
+        if sum(product.GetAtomWithIdx(idx).GetAtomicNum() > 1 for idx in atoms) < 4:
+            continue
+        try:
+            fragment = Chem.MolFragmentToSmiles(
+                product, sorted(atoms), isomericSmiles=True, canonical=True
+            )
+            fragment_mol = Chem.MolFromSmiles(fragment)
+            if fragment_mol is not None:
+                scaffold = Chem.MolToSmiles(fragment_mol, canonical=True, isomericSmiles=True)
+                if scaffold != canonical_product:
+                    break
+        except (ValueError, RuntimeError):
+            scaffold = ""
+    if not scaffold or scaffold == canonical_product and centers:
+        try:
+            murcko = MurckoScaffold.GetScaffoldForMol(product)
+            if murcko is not None and murcko.GetNumHeavyAtoms() >= 4:
+                scaffold = Chem.MolToSmiles(murcko, canonical=True, isomericSmiles=True)
+        except (ValueError, RuntimeError):
+            scaffold = ""
+    return {
+        "core_reactant": lim_r_smi,
+        "core_product": canonical_product,
+        "core_product_scaffold": scaffold or canonical_product,
+    }

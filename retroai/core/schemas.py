@@ -13,12 +13,12 @@ def _clamp_safety_score(score):
         return 3
 
 
-def _clamp_step_yield(value, default=0.80):
+def _clamp_step_yield(value, default=None):
     try:
         value = float(value)
     except (TypeError, ValueError):
         return default
-    return max(0.35, min(0.95, value)) if math.isfinite(value) else default
+    return max(0.0, min(1.0, value)) if math.isfinite(value) else default
 
 
 class RankedConditionSet(BaseModel):
@@ -53,7 +53,7 @@ class StepClassificationItem(BaseModel):
     experimental_procedure: str
     source_doi_or_patent: str = ""
     typical_conditions: str = ""
-    assumed_step_yield: float = 0.80
+    assumed_step_yield: float | None = Field(default=None, ge=0, le=1)
 
     @field_validator("safety_green_score", mode="before")
     @classmethod

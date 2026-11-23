@@ -1,0 +1,3 @@
+# Full project and test-runtime dependencies are declared in pyproject.toml.
+-e .
+drfp>=0.3.7,<0.4

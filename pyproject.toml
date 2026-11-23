@@ -34,6 +34,7 @@ dependencies = [
     # Published ORD wheels require protobuf <6. Allow 6.x as soon as ORD does.
     "protobuf>=5.29.6,<7",
     "numpy",
+    "drfp>=0.3.7,<0.4",
     "pandas<3",
     "ipywidgets",
     "ipython",
