@@ -44,7 +44,12 @@ from retroai.core.resolver import _resolve_chemical_identifier
 from retroai.core.schemas import StrategySummary, _clamp_safety_score, _clamp_step_yield
 from retroai.core.state import WorkbenchState
 from retroai.engine.aizynth import cleanup_aizynth_memory, get_finder, register_custom_lab_stock
-from retroai.engine.pipeline import compute_composite_route_score, deduplicate_retro_state, run_retrosynthesis_pipeline
+from retroai.engine.pipeline import (
+    annotate_route_strategy,
+    compute_composite_route_score,
+    deduplicate_retro_state,
+    run_retrosynthesis_pipeline,
+)
 from retroai.ord.fingerprints import _parse_reaction_mols
 from retroai.ord.validator import ORDRetrosynthesisValidator, get_ord_validator
 
@@ -230,7 +235,9 @@ def _enrich_route_for_chemforge(route: dict, idx: int) -> dict:
     total_leaves = max(1, sm.get("total_leaves", 1))
     in_stock = sm.get("in_stock_count", 0)
     is_convergent = total_leaves >= 3 and n_steps >= 2
-    lls = max(1, n_steps - (1 if is_convergent and n_steps >= 3 else 0))
+    lls = int(route.get("lls_length") or max(
+        1, n_steps - (1 if is_convergent and n_steps >= 3 else 0)
+    ))
     avg_safe = float(route.get("avg_safety_score", 4.0))
     risk_cnt = int(route.get("selectivity_risk_count", 0))
     pg_cnt = sum(1 for s in steps if s.get("protecting_group_note", "None") != "None")
@@ -252,12 +259,39 @@ def _enrich_route_for_chemforge(route: dict, idx: int) -> dict:
         "SAFE REAGENTS": int(min(100, round(avg_safe * 20))),
     }
     failures = []
+    for loop in route.get("unproductive_loops", []):
+        failures.append(
+            f"<b>Unproductive route loop (Steps {', '.join(str(x) for x in loop.get('step_indices', []))}):</b> "
+            f"{html.escape(loop.get('type', '').replace('_', ' '))}; apply an {int(abs(0.08) * 100)}% route-score penalty."
+        )
     for s in steps:
         st_num = s.get("step_index", 1)
         rxn_name = s.get("reaction_name", "Step")
         ov = s.get("ord_validation") or {}
         if s.get("selectivity_warning", "None") != "None":
             failures.append(f"<b>Step {st_num} ({html.escape(rxn_name)}):</b> {html.escape(s['selectivity_warning'])}")
+        stereo_risk = s.get("stereochemical_control_risk", "None")
+        if stereo_risk != "None":
+            precedent_options = []
+            for hit in s.get("stereochemical_precedents", [])[:3]:
+                annotation = next(
+                    (hit[field] for field in ("dr", "ee", "er") if hit.get(field)),
+                    "stereoselective",
+                )
+                source = hit.get("doi") or hit.get("reaction_id") or "CbyD"
+                precedent_options.append(
+                    f"{html.escape(str(source))} ({html.escape(str(annotation))}; "
+                    f"{html.escape(hit.get('catalysts') or hit.get('ligands') or 'conditions in DOI')})"
+                )
+            option_text = (
+                " Actionable CbyD alternatives: " + "; ".join(precedent_options)
+                if precedent_options
+                else " Consider an enantiopure chiral-pool source or a documented Evans/Ellman/Myers auxiliary."
+            )
+            failures.append(
+                f"<b>Step {st_num} Stereochemical Control Risk:</b> "
+                f"{html.escape(stereo_risk)}{option_text}"
+            )
         if ov.get("smarts_matched_count") and ov.get("ord_recorded_byproducts"):
             failures.append(
                 f"<b>Step {st_num} ORD Recorded Side-Products (<code>is_desired_product=False</code>):</b> "
@@ -285,6 +319,52 @@ def _enrich_route_for_chemforge(route: dict, idx: int) -> dict:
         "metrics": metrics,
         "failures": failures,
     }
+
+
+def _render_complexity_sparkline_html(route: dict) -> str:
+    profile = route.get("lls_complexity_profile") or []
+    sa_rows = [row for row in profile if row.get("product_sascore") is not None]
+    sps_rows = [row for row in profile if row.get("product_sps") is not None]
+    if not sa_rows or not sps_rows:
+        return "<div style='font-size:10px;color:#64748b;'>Complexity profile unavailable in this RDKit build.</div>"
+    sascores = [row["product_sascore"] for row in sa_rows]
+    sps_values = [row["product_sps"] for row in sps_rows]
+    lo_sa, hi_sa = min(sascores), max(sascores)
+    lo_sps, hi_sps = min(sps_values), max(sps_values)
+    width, height, padding = 320, 58, 6
+
+    def points(rows, metric, field, low, high):
+        values = [row[field] for row in rows]
+        if len(values) == 1:
+            xs = [width / 2]
+        else:
+            xs = [padding + i * (width - 2 * padding) / (len(values) - 1) for i in range(len(values))]
+        ys = [
+            height - padding - ((value - low) / max(high - low, 1e-9)) * (height - 2 * padding)
+            for value in values
+        ]
+        markers = "".join(
+            f"<circle cx='{x:.1f}' cy='{y:.1f}' r='3.2' fill="
+            f"'{ '#f59e0b' if rows[index].get('is_strategic_key_step') else ('#0284c7' if metric == 'SAScore' else '#0d9488') }'>"
+            f"<title>Step {rows[index].get('step_index')}: {metric} {values[index]:.2f}</title></circle>"
+            for index, (x, y) in enumerate(zip(xs, ys))
+        )
+        polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y in zip(xs, ys))
+        return polyline, markers
+
+    sa_points, sa_markers = points(sa_rows, "SAScore", "product_sascore", lo_sa, hi_sa)
+    sps_points, sps_markers = points(sps_rows, "SPS", "product_sps", lo_sps, hi_sps)
+    key_count = route.get("strategic_key_step_count", 0)
+    return (
+        "<div style='font-size:10px;color:#334155;margin:6px 0 3px;'><b>LLS COMPLEXITY PROFILE</b> · "
+        f"<span style='color:#0284c7;'>SAScore</span> · <span style='color:#0d9488;'>SPS</span> · "
+        f"{key_count} strategic key step(s)</div>"
+        f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='Route complexity profile' "
+        "style='width:100%;max-width:420px;height:58px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;'>"
+        f"<polyline points='{sa_points}' fill='none' stroke='#0284c7' stroke-width='2'/>{sa_markers}"
+        f"<polyline points='{sps_points}' fill='none' stroke='#0d9488' stroke-width='2'/>{sps_markers}"
+        "</svg>"
+    )
 
 
 def _render_step_source(source, ord_ids, verified_literature):
@@ -493,6 +573,11 @@ def _render_routes_html_from_results(res: dict, ord_validator: ORDRetrosynthesis
         steps_html = []
         for st in r["steps"]:
             svg = mol_or_rxn_to_svg_html(st["forward_smiles"], width=480, height=120, label=f"Step {st['step_index']}: {st['reaction_name']}")
+            key_step = (
+                "<span style='display:inline-block;background:#fef3c7;color:#92400e;border:1px solid #f59e0b;"
+                "padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;'>⭐ STRATEGIC KEY STEP</span>"
+                if st.get("is_strategic_key_step") else ""
+            )
             swap = f" · <span style='color:#0d9488;font-weight:600;'>Green Swap: {html.escape(st['greener_solvent_swap'])}</span>" if st.get("greener_solvent_swap", "None") != "None" else ""
             ord_panel_html = _render_ord_step_panel_html(st.get("ord_validation"), st.get("verified_literature") or [])
             plan = eln_plans.get(st["step_index"])
@@ -501,6 +586,7 @@ def _render_routes_html_from_results(res: dict, ord_validator: ORDRetrosynthesis
             copy_button = f"<button type='button' class='cf-btn cf-copy-eln' {copy_attrs}>📋 Copy Step ELN to Clipboard</button>"
             steps_html.append(
                 f"<div class='cf-step-box'>{svg}"
+                f"<div style='margin:4px 0;'>{key_step}</div>"
                 f"<div style='font-size:11px;color:#334155;margin-top:4px;'>"
                 f"<b>Primary conditions:</b> {html.escape(st['typical_conditions'])} · <b>Safety:</b> {_clamp_safety_score(st.get('safety_green_score'))}/5{swap}</div>"
                 f"{ord_panel_html}"
@@ -515,11 +601,16 @@ def _render_routes_html_from_results(res: dict, ord_validator: ORDRetrosynthesis
         )
         pareto_badge = "<span class='cf-badge-green' style='background:#ccfbf1;color:#0f766e;border:1px solid #5eead4;margin-left:4px;'>⭐ PARETO</span>" if r.get("is_pareto_optimal") else ""
         solved_badge = "<span class='cf-badge-green'>🟢 SOLVED</span>" if r.get("is_solved") else "<span class='cf-badge-green' style='background:#fef2f2;color:#dc2626;'>🟡 PARTIAL</span>"
+        key_badge = (
+            f"<span style='background:#fff7ed;color:#c2410c;border:1px solid #fdba74;padding:2px 6px;"
+            f"border-radius:4px;font-size:10px;font-weight:700;margin-left:4px;'>"
+            f"⭐ {r.get('strategic_key_step_count', 0)} KEY</span>"
+        )
         cards_html.append(f"""
         <div class="cf-route-card">
           <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">
             <div>
-              {solved_badge}{pareto_badge}
+              {solved_badge}{pareto_badge}{key_badge}
               <strong style="font-size:14px;margin-left:6px;color:#0f172a;">Route {cf['route_letter']} — {r['step_count']} steps, {cf['topology']}</strong>
               <span style="font-size:11px;color:#475569;margin-left:4px;">(LLS {cf['lls']} · Stock {r['starting_materials']['in_stock_count']}/{r['starting_materials']['total_leaves']} · Bottleneck: Step {cf['ord_bottleneck']})</span>
             </div>
@@ -529,6 +620,7 @@ def _render_routes_html_from_results(res: dict, ord_validator: ORDRetrosynthesis
             </div>
           </div>
           <div style="font-size:11px;color:#475569;margin:6px 0;"><b>Precedent:</b> {html.escape(cf['precedent_list'])}</div>
+          {_render_complexity_sparkline_html(r)}
           <div class="cf-pill-grid">{pills_html}</div>
           <details class="cf-fail-details">
             <summary>⚠ WHY MIGHT THIS FAIL? ({len(cf['failures'])})</summary>
@@ -926,6 +1018,7 @@ def _render_workbench(ord_validator: ORDRetrosynthesisValidator):
           <button class="cf-mode-pill" onclick="cfSetRankMode('discovery', this)">Discovery (Fast)</button>
           <button class="cf-mode-pill" onclick="cfSetRankMode('evidence', this)" title="Weights Route-Level ORD Empirical Confidence Score (S_ORD) highest">Evidence-Backed (ORD)</button>
           <button class="cf-mode-pill" onclick="cfSetRankMode('green', this)">Green / Safe</button>
+          <button class="cf-mode-pill" onclick="cfSetRankMode('strategy', this)" title="Prioritizes SAScore/SPS complexity-building key steps and penalizes unproductive loops">Strategy / Complexity-Building</button>
         </div>
         <div style="display:flex;gap:6px;flex-wrap:wrap;">
           <button id="cf-plan-btn" class="cf-btn cf-btn-green" style="padding:7px 14px;font-size:12.5px;" onclick="cfRunSynthesis()">🚀 Plan Synthesis Route</button>
@@ -987,6 +1080,7 @@ def _render_workbench(ord_validator: ORDRetrosynthesisValidator):
           <div class="cf-cfg-item" style="display:flex;flex-direction:column;justify-content:center;gap:4px;">
             <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfg-first" style="width:auto;" /> Stop at First Solved</label>
             <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfg-gemini" checked style="width:auto;" /> Gemini + ORD Grounding</label>
+            <label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="cfg-common-stock" checked style="width:auto;" /> Treat Common Lab Reagents as On-Shelf</label>
           </div>
         </div>
       </details>
@@ -1353,6 +1447,7 @@ async function cfRunSynthesis() {{
     exclude_reactions: document.getElementById("cfg-exclude").value,
     return_first: document.getElementById("cfg-first").checked,
     use_gemini: useGem,
+    use_common_lab_reagents: document.getElementById("cfg-common-stock").checked,
     genai_model: selModel,
     genai_thinking: selThinking,
     lock_smarts: document.getElementById("cf-lock-smarts").value.trim()
@@ -1652,7 +1747,9 @@ class _Workbench:
                     f"ORD Step Conf: {ov.get('step_ord_confidence')} (Max Sim: {ov.get('max_rxn_similarity')}, "
                     f"Mean Yield: {ov.get('mean_analog_yield_pct')}%, HTE Fail <15%: {ov.get('hte_failure_rate_pct')}%) | "
                     f"Conditions: {s['typical_conditions']} | Safety: {s['safety_green_score']}/5 | "
-                    f"Selectivity/ORD Warning: {s['selectivity_warning']}"
+                    f"Selectivity/ORD Warning: {s['selectivity_warning']} | "
+                    f"Stereochemical Control Risk: {s.get('stereochemical_control_risk', 'None')} | "
+                    f"Strategic Key Step: {bool(s.get('is_strategic_key_step'))}"
                 )
                 cbyd_hits = [
                     {
@@ -1770,7 +1867,13 @@ class _Workbench:
             ui_cfg = {}
         if ui_cfg.get("genai_model") or ui_cfg.get("genai_thinking"):
             set_active_genai_settings(ui_cfg.get("genai_model"), ui_cfg.get("genai_thinking"))
-        mode_map = {"cro": "process_scaleup", "discovery": "medchem_fast", "evidence": "balanced", "green": "green_safe"}
+        mode_map = {
+            "cro": "process_scaleup",
+            "discovery": "medchem_fast",
+            "evidence": "balanced",
+            "green": "green_safe",
+            "strategy": "strategy_complexity",
+        }
         rk_mode = mode_map.get(ui_cfg.get("rank_mode", "cro"), "balanced")
         excl_raw = ui_cfg.get("exclude_reactions", "")
         excl_list = [x.strip() for x in excl_raw.split(",") if x.strip()] if isinstance(excl_raw, str) else list(excl_raw)
@@ -1787,6 +1890,7 @@ class _Workbench:
             "target_scale_grams": float(ui_cfg.get("scale_grams", 1.0)),
             "exclude_reaction_names": excl_list,
             "use_gemini": bool(ui_cfg.get("use_gemini", True)),
+            "use_common_lab_reagents": bool(ui_cfg.get("use_common_lab_reagents", True)),
         })
         res = run_retrosynthesis_pipeline(
             target_smiles=target,
@@ -1832,7 +1936,13 @@ class _Workbench:
                 "error": "No existing synthesis routes in memory. Click '🚀 Plan Synthesis Route' first to generate routes."
             })
 
-        mode_map = {"cro": "process_scaleup", "discovery": "medchem_fast", "evidence": "balanced", "green": "green_safe"}
+        mode_map = {
+            "cro": "process_scaleup",
+            "discovery": "medchem_fast",
+            "evidence": "balanced",
+            "green": "green_safe",
+            "strategy": "strategy_complexity",
+        }
         rk_mode = mode_map.get(rank_mode_ui, res.get("ranking_mode", "balanced")) if rank_mode_ui else res.get("ranking_mode", "balanced")
         self.state.retro_search_params["use_gemini"] = True
         self.state.retro_search_params["ranking_mode"] = rk_mode
@@ -1867,9 +1977,14 @@ class _Workbench:
             r["ord_max_hte_fail_pct"] = ord_route_eval["ord_max_hte_fail_pct"]
 
             avg_safe = sum(s["safety_green_score"] for s in steps_data) / max(1, len(steps_data))
-            risk_cnt = sum(1 for s in steps_data if s["selectivity_warning"] != "None")
+            risk_cnt = sum(
+                1 for s in steps_data
+                if s.get("selectivity_warning", "None") != "None"
+                or s.get("stereochemical_control_risk", "None") != "None"
+            )
             r["avg_safety_score"] = round(avg_safe, 2)
             r["selectivity_risk_count"] = risk_cnt
+            annotate_route_strategy(r)
             r["composite_score"] = compute_composite_route_score(r, rk_mode)
             r["score"] = r["composite_score"]
 
@@ -1932,6 +2047,13 @@ class _Workbench:
         ord_panel = _render_ord_step_panel_html(cls.get("ord_validation"), cls.get("verified_literature") or [])
         svg = mol_or_rxn_to_svg_html(s, width=480, height=130, label=cls.get("reaction_name", "Reaction"))
         used_m = cls.get("step_genai_model") or "RDKit"
+        stereo_risk = cls.get("stereochemical_control_risk", "None")
+        stereo_html = (
+            f"<div style='margin-top:6px;padding:6px 8px;border:1px solid #f59e0b;"
+            f"background:#fffbeb;border-radius:5px;color:#92400e;'>"
+            f"<b>⚠ {html.escape(stereo_risk)}</b></div>"
+            if stereo_risk != "None" else ""
+        )
         return IPython.display.JSON({"html": f"""
     <div class="cf-route-card">
       <div style="font-size:10px;font-weight:700;color:#0284c7;margin-bottom:4px;">REACTION ANALYSIS + ORD/CBYD VALIDATION · {html.escape(used_m.upper())}</div>
@@ -1940,6 +2062,7 @@ class _Workbench:
       <div style="margin-top:8px;font-size:12px;">
         <b>Conditions:</b> {html.escape(cls.get('typical_conditions', ''))} · <b>Safety:</b> {cls.get('safety_green_score', 4)}/5 · <b>Green Swap:</b> {html.escape(cls.get('greener_solvent_swap', 'None'))}
       </div>
+      {stereo_html}
       {_render_ranked_conditions_html(cls)}
       {_render_step_procedure_html(cls)}
       {_render_step_analytics_html(s)}

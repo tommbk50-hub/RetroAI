@@ -54,3 +54,7 @@ include = ["retroai", "retroai.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py", "benchmark_*.py"]
+markers = [
+    "benchmark: opt-in CbyD route benchmark (requires --cbyd-trees)",
+]

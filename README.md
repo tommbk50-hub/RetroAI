@@ -20,6 +20,8 @@ AiZynthFinder uses patterns learned from patent reactions to suggest ways to bre
 RetroAI looks for similar experiments in the **Open Reaction Database (ORD)**. It uses evidence such as reported yields and failures, when available, to score the support for each step and flag the least-supported step as the **bottleneck**. The ORD confidence score summarizes that evidence; it is not a probability that the route will work.
 ORD and optional **Chemistry by Design (CbyD)** records are standardized and desalted before indexing. Validation uses a local DuckDB funnel: exact product-connectivity hits and DRFP candidates are shortlisted first, then chemically checked with reaction-center SMARTS and functional-group changes before empirical ranking. CbyD candidates are additionally re-ranked by spectator functional groups that survived the precedent reaction. Missing precedents are explicitly marked **Unvalidated** rather than receiving synthetic yield evidence; ELN scaling then requires an explicit scenario yield until empirical data is available.
 The overall ranking also considers the search score, the number of steps, starting material availability, and estimated safety. Use **Rank By** to emphasize practical considerations such as stock and safety (**CRO-Practical**), shorter routes (**Discovery (Fast)**), stronger experimental evidence (**Evidence-Backed (ORD)**), or estimated safety and environmental impact (**Green / Safe**). **Re-classify & Re-score (ORD + AI)** refreshes the evidence and scores for existing routes without starting a new search. A high score is not a substitute for lab validation or safety review.
+The **Strategy / Complexity-Building** profile adds RDKit SAScore/SPS jumps along the longest linear sequence, highlights strategic key steps, and penalizes reversible protection/deprotection or esterification/hydrolysis loops. Route cards include the resulting sparkline and step-level complexity payload.
+Steps that create or invert tetrahedral or alkene stereochemistry are checked for chiral catalysts, ligands, pool-derived materials, or auxiliaries. Uncontrolled stereochemical changes appear in **Why might this fail?** with analogous stereoselective CbyD precedents and curated chiral-pool/Evans/Ellman/Myers options.
 ### Explore the other tabs
 - **Reaction** checks a reaction you draw or enter against similar recorded experiments.
 - **Analytical** predicts signals you might see in a mass spectrometry report. With Gemini enabled, it can also help interpret a pasted report.
@@ -56,11 +58,24 @@ indexes reactions reachable in the generated tree. By default, RetroAI writes th
 database. CbyD is wholly optional: absent tables degrade to the existing ORD-only flow.
 Ingested DOI, citation, mapping-confidence, parsed yield, chemoselectivity, and hazard
 metadata remain available to the Chemist AI Agent and Reaction tab.
+The Synthesis settings enable a common lab-reagent allowlist by default for reagents that
+commercial catalogs often omit (including MeI, halogens, peroxide, thionyl chloride,
+water/ammonia, acetic anhydride, mesyl chloride, and trimethylsilyl chloride). It can be
+disabled per search without changing registered in-house stock.
 
 Run the offline CbyD ingestion/precedent benchmark smoke suite with:
 
 ```sh
-python -m pytest -q tests/test_cbyd.py
+python -m pytest -q tests/test_cbyd.py tests/test_cbyd_integration.py
+```
+
+Generate CbyD's native AiZynthFinder route trees with the upstream `build_route_tree.py`,
+then opt in to the target-recovery, stock-coverage, convergence, and Lock Selected benchmark:
+
+```sh
+python -m pytest -m benchmark \
+  --cbyd-trees data/cbyd/data/route_tree.jsonl \
+  tests/benchmarks/benchmark_cbyd.py
 ```
 
 
@@ -98,6 +113,7 @@ Manual reaction callback
 CbyD ingestion (optional/offline)
 `- python -m retroai.cbyd.ingest
    |- cbyd.parser: normalize CbyD steps, yields, conditions, and spectator groups
+   |- cbyd.advisor: stereochemical risk and chiral-pool/auxiliary alternatives
    `- cbyd.ingest: deduplicate into cbyd_reactions and record the release version
 ```
 
@@ -124,7 +140,7 @@ Colab callback behavior belongs in `ui`.
 | `retroai/core/config.py` | Process setup, credentials, and active Gemini settings | `get_secret()`, `set_active_genai_settings()`, `GEMINI_MODEL_CATALOG`, and ONNX memory options. This module is the import-time configuration exception. |
 | `retroai/core/state.py` | One workbench session's mutable state | `WorkbenchState`, `active_route_steps()`, search defaults, route results, caches, stock, and canvas state. Pass the instance explicitly; do not replace it with notebook or module globals. |
 | `retroai/core/schemas.py` | Shared structured-output schemas and normalization | Pydantic models for condition rankings, stoichiometry, step classifications, and strategy summaries; clamps safety/yield at the schema boundary. |
-| `retroai/core/chem_utils.py` | Reusable RDKit molecule and reaction analytics | Primary-molecule extraction, descriptors, SVG cards, byproduct guesses, LC-MS ions, and workup predictions. Use here for chemistry logic needed by more than one upper layer. |
+| `retroai/core/chem_utils.py` | Reusable RDKit molecule and reaction analytics | Primary-molecule extraction, descriptors, SVG cards, byproduct guesses, LC-MS ions, workup predictions, lazy SAScore/SPS complexity jumps, and configuration-aware stereochemical comparison. Use here for chemistry logic needed by more than one upper layer. |
 | `retroai/core/resolver.py` | Chemical identifier resolution | `_resolve_chemical_identifier()` handles direct structures plus explicit network lookups for external identifiers. |
 | `retroai/engine/aizynth.py` | AiZynthFinder lifecycle, templates, stock, and cleanup | `get_finder()`, `_harvest_uspto_templates_from_finder()`, `_flatten_reaction_tree()`, `cleanup_aizynth_memory()`, and `register_custom_lab_stock()`. Finder loading remains lazy and requires `data/config.yml`. |
 | `retroai/engine/pipeline.py` | End-to-end route search and route-level scoring | `run_retrosynthesis_pipeline()`, `compute_composite_route_score()`, and result compaction. This is the orchestration seam between search, classification, ORD evidence, stock, and state. |
@@ -133,6 +149,7 @@ Colab callback behavior belongs in `ui`.
 | `retroai/ord/validator.py` | ORD persistence, ingestion, retrieval, and route confidence | `ORDRetrosynthesisValidator`, database migration/backfill, in-memory DRFP index, online/Hugging Face ingestion, `validate_step()`, and `score_route()`. Construction may create a database; imports must not. |
 | `retroai/cbyd/parser.py` | CbyD normalization and condition parsing | CbyD step validation, canonical/desalted deduplication, structured yield/condition fields, spectator survival tags, and deterministic hazard flags. |
 | `retroai/cbyd/ingest.py` | Optional CbyD DuckDB ingestion | CLI/function for route JSON ingestion, mapping-confidence/route-tree filtering, deduplication, `cbyd_reactions`, and release metadata. |
+| `retroai/cbyd/advisor.py` | Stereochemical controls and CbyD alternatives | Flags uncontrolled creation/inversion, queries annotated stereoselective precedents, and exposes a curated chiral-pool/auxiliary catalog. |
 | `retroai/ai/gemini_client.py` | Gemini client/configuration and fallback calls | `get_gemini_client()`, `_build_genai_config()`, and `call_gemini_with_config()`. Keep model selection and retry behavior here. |
 | `retroai/ai/classifier.py` | Step-level RDKit/ORD/Gemini enrichment | `rdkit_classify_step()`, `batch_classify_with_gemini()`, `_classify_route_steps()`, condition ranking, stoichiometry transfer, evidence context, and the per-state enrichment cache. RDKit/ORD baseline must remain usable without Gemini. |
 | `retroai/ai/literature.py` | DOI and literature verification | Crossref identity checks and Europe PMC/PubMed candidate discovery. Network access happens only when these functions are called. |
@@ -172,6 +189,7 @@ Colab callback behavior belongs in `ui`.
 | Change ORD matching or false-positive admission | `retroai/ord/fingerprints.py` and `ORDRetrosynthesisValidator._validate_step()` | Add exact, progressive-SMARTS, and reject-counterexample tests in `tests/test_ord_validator.py`. |
 | Change ORD protobuf normalization or indexed fields | `retroai/ord/parser.py` | Update validator schema migration/backfill, bulk ingestion, and parser/migration tests together. |
 | Change CbyD route normalization or release ingestion | `retroai/cbyd/parser.py` and `retroai/cbyd/ingest.py` | Preserve route-tree flag filtering, canonical deduplication, release metadata, and validator compatibility. |
+| Change complexity key-step or stereochemical advice | `retroai/core/chem_utils.py`, `retroai/engine/pipeline.py`, and `retroai/cbyd/advisor.py` | Keep the LLS payload JSON-like, preserve lazy RDKit imports, route stereochemical decisions through the evidence gate, and render risks in the existing failure panel. |
 | Add an AI-enriched step field or citation rule | `retroai/core/schemas.py` and `retroai/ai/classifier.py` | Revalidate the returned object, enforce evidence allowlists, then consume it in `retroai/ui/workbench.py`. |
 | Add chemistry analytics used across tabs | `retroai/core/chem_utils.py` | Call from AI/UI rather than duplicating RDKit logic; extend `tests/test_chem_utils.py`. |
 | Add or rename a frontend action | `retroai/ui/workbench.py` | Keep the JavaScript `invokeFunction(...)` name aligned with the Python callback registration and runtime callback test. |
@@ -212,6 +230,10 @@ Colab callback behavior belongs in `ui`.
   integrated search/pipeline state flow. Tests in this file must remain offline.
 - `tests/test_cbyd.py`: offline CbyD parsing, deduplication, migration/schema, fallback
   retrieval, multi-step yield handling, provenance, and hazard guardrails.
+- `tests/test_cbyd_integration.py`: self-contained CbyD route-tree/schema, complexity,
+  chemoselective re-ranking, stock, and stereochemical-risk coverage.
+- `tests/benchmarks/benchmark_cbyd.py`: opt-in native CbyD tree benchmark for route
+  recovery, convergent searches, Lock Selected constraints, and stock coverage.
 
 Run the repository checks from the root:
 

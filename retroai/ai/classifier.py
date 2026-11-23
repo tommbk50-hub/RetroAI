@@ -13,10 +13,12 @@ from rdkit.Chem import Descriptors
 
 from retroai.core.chem_utils import (
     _canonical_molecule_smiles,
+    rdkit_detect_stereochemical_changes,
     rdkit_enumerate_byproducts,
     rdkit_predict_lcms_ions,
     rdkit_predict_workup_properties,
 )
+from retroai.cbyd.advisor import advise_stereochemical_control
 from retroai.core.config import ACTIVE_GENAI_SETTINGS
 from retroai.core.schemas import (
     ReagentStoichItem,
@@ -195,6 +197,53 @@ def _step_transformation_keywords(signature, template_info=None):
                                       + _fg_search_terms(signature.get("consumed_fgs", []))[:2]))
 
 
+def _has_new_cyclic_protecting_group(forward_smiles: str) -> bool:
+    if ">>" not in forward_smiles:
+        return False
+    reactant_side, product_side = forward_smiles.split(">>", 1)
+    pattern = Chem.MolFromSmarts("[C;R]([O,S;R])[O,S;R]")
+    if pattern is None:
+        return False
+
+    def count(side):
+        return sum(
+            len(mol.GetSubstructMatches(pattern))
+            for token in side.split(".")
+            for mol in [Chem.MolFromSmiles(token.strip())]
+            if mol is not None
+        )
+
+    return count(product_side) > count(reactant_side)
+
+
+def classify_step_strategy_role(
+    reaction_name: str = "",
+    conditions: str = "",
+    forward_smiles: str = "",
+) -> tuple[str, str]:
+    """Classify transformations that should not count as strategic key steps."""
+    text = f"{reaction_name} {conditions}".casefold()
+    if re.search(r"\bdeprotect(?:ion|ed|ing)?\b|benzyl hydrogenolysis|pg removal", text):
+        return "deprotection", "Deprotection steps are excluded from key-step eligibility."
+    if re.search(r"\bprotect(?:ion|ed|ing)?\b|silylation|tosylation|bocylation|fmocylation", text):
+        return "protection", "Protection steps are excluded from key-step eligibility."
+    if re.search(r"\b(?:acetal|ketal|ketalization|dithiane|thioketal)\b", text):
+        return "protecting_acetal", "Cyclic acetal/ketal/dithiane formation is excluded from key-step eligibility."
+    if _has_new_cyclic_protecting_group(forward_smiles):
+        return "protecting_acetal", "Cyclic acetal/ketal/dithiane formation is excluded from key-step eligibility."
+    bond_building = re.search(
+        r"\b(?:cycli[sz](?:ation|ed)|cycloaddition|annulation|coupling|"
+        r"bond construction|bond formation|arylation|alkylation|amination|"
+        r"amidation|etherification|esterification|epoxidation|olefination)\b",
+        text,
+    )
+    if not bond_building and re.search(
+        r"\b(?:oxidation|reduction|hydrogenation|dehydrogenation|redox)\b", text
+    ):
+        return "simple_redox", "Simple redox steps are excluded from key-step eligibility."
+    return "bond_construction", ""
+
+
 def rdkit_classify_step(
     forward_smiles: str, *, template_info=None, ord_validator: ORDRetrosynthesisValidator | None = None
 ) -> dict:
@@ -252,7 +301,28 @@ def rdkit_classify_step(
         hazard_flags=hazards,
         safer_alternatives=alternatives,
         data_gap_warnings=data_gaps,
+        strategy_role=classify_step_strategy_role(keywords)[0],
     ).model_dump()
+    strategy_role, key_step_exclusion = classify_step_strategy_role(
+        info["reaction_name"], info["typical_conditions"], s
+    )
+    stereo_changes = rdkit_detect_stereochemical_changes(
+        s, (template_info or {}).get("mapped_forward_smiles", "")
+    )
+    stereo_advice = advise_stereochemical_control(
+        s,
+        stereo_changes,
+        conditions=info["typical_conditions"],
+        validator=ord_validator,
+        mapped_reaction_smiles=(template_info or {}).get("mapped_forward_smiles", ""),
+    )
+    info.update(
+        strategy_role=strategy_role,
+        key_step_eligible=not bool(key_step_exclusion),
+        key_step_exclusion=key_step_exclusion,
+        stereochemical_changes=stereo_changes,
+        **stereo_advice,
+    )
     _, products = _parse_reaction_mols(s)
     stereo = sum(len(Chem.FindMolChiralCenters(mol, includeUnassigned=True)) for mol in products)
     info.update(ord_validation=ov, gemini_enriched=False, verified_literature=[], step_genai_model="", step_genai_thinking="",
@@ -456,7 +526,20 @@ def batch_classify_with_gemini(
                     != "CbyD"
                 ),
             )
-            for field in ("cbyd_precedents", "hazard_flags", "safer_alternatives", "data_gap_warnings"):
+            for field in (
+                "cbyd_precedents",
+                "hazard_flags",
+                "safer_alternatives",
+                "data_gap_warnings",
+                "strategy_role",
+                "key_step_eligible",
+                "key_step_exclusion",
+                "stereochemical_changes",
+                "stereochemical_control_risk",
+                "stereochemical_precedents",
+                "chiral_pool_suggestions",
+                "chiral_auxiliary_suggestions",
+            ):
                 info[field] = results[smi].get(field, [])
             results[smi].update(info, gemini_enriched=True, gemini_tag=tag,
                                 step_genai_model=used_model, step_genai_thinking=used_think,

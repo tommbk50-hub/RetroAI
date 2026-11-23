@@ -344,13 +344,32 @@ class ORDRetrosynthesisValidator:
         return self._cbyd_index_size
 
     def _query_cbyd_precedents(
-        self, s, prod_conn, tiers, delta, query_drfp, query_bits, *, top_k=50
+        self,
+        s,
+        prod_conn,
+        tiers,
+        delta,
+        query_drfp,
+        query_bits,
+        *,
+        top_k=50,
+        stereoselective_only=False,
     ) -> tuple[list, int]:
         """Retrieve and chemically gate CbyD candidates, then rerank by spectator overlap."""
         if not self._cbyd_index_size:
             return [], 0
         candidate_ids, similarities = set(), {}
         with duckdb.connect(self.db_path, read_only=True) as con:
+            annotated_ids = set()
+            if stereoselective_only:
+                annotated_ids = {
+                    row[0]
+                    for row in con.execute(
+                        "SELECT reaction_id FROM cbyd_reactions "
+                        "WHERE coalesce(dr, '') <> '' OR coalesce(ee, '') <> '' "
+                        "OR coalesce(er, '') <> ''"
+                    ).fetchall()
+                }
             exact_ids = set()
             if prod_conn:
                 exact_ids = {
@@ -359,14 +378,21 @@ class ORDRetrosynthesisValidator:
                         [prod_conn],
                     ).fetchall()
                 }
+                if stereoselective_only:
+                    exact_ids &= annotated_ids
                 candidate_ids.update(exact_ids)
             if self._cbyd_index_size <= 300:
                 candidate_ids.update(row[0] for row in con.execute(
                     "SELECT reaction_id FROM cbyd_reactions"
-                ).fetchall())
+                ).fetchall() if not stereoselective_only or row[0] in annotated_ids)
             elif query_drfp and self._drfp_cbyd_matrix.size:
                 scores = tanimoto_packed_fp_batch(query_drfp, self._drfp_cbyd_matrix)
                 eligible = np.flatnonzero(scores >= 0.10)
+                if stereoselective_only:
+                    eligible = np.asarray([
+                        idx for idx in eligible
+                        if str(self._drfp_cbyd_ids[idx]) in annotated_ids
+                    ], dtype=int)
                 ranked = sorted(eligible, key=lambda idx: (-float(scores[idx]), str(self._drfp_cbyd_ids[idx])))[:200]
                 for idx in ranked:
                     reaction_id = str(self._drfp_cbyd_ids[idx])
@@ -386,6 +412,10 @@ class ORDRetrosynthesisValidator:
         query_tags = set(query_spectators["survived"])
         admitted = []
         for rec in rows:
+            if stereoselective_only and not any(
+                str(rec.get(field) or "").strip() for field in ("dr", "ee", "er")
+            ):
+                continue
             rxn = rec.get("canonical_reaction") or rec.get("rxn_smiles") or ""
             gate = _match_ord_gate(
                 *_parse_reaction_mols(rxn),
@@ -408,6 +438,7 @@ class ORDRetrosynthesisValidator:
             drfp = drfp or 0.0
             candidate_tags = set(_json_value(rec.get("survived_fgs"), {}))
             overlap = len(query_tags & candidate_tags) / len(query_tags) if query_tags else 0.0
+            spectator_complete = not query_tags or query_tags <= candidate_tags
             transformation_similarity = 0.45 * base + 0.55 * (0.50 * structural + 0.50 * drfp)
             rec.update({
                 "ord_id": rec["reaction_id"],
@@ -417,13 +448,75 @@ class ORDRetrosynthesisValidator:
                 "similarity": 0.85 * transformation_similarity + 0.15 * overlap,
                 "transformation_similarity": transformation_similarity,
                 "spectator_overlap": round(overlap, 3),
+                "spectator_complete": spectator_complete,
+                "missing_spectator_groups": sorted(query_tags - candidate_tags),
                 "tolerated_functional_groups": sorted(candidate_tags),
                 "matched_smarts_label": label,
                 "reagents": rec.get("general_reagents") or "None",
             })
             admitted.append(rec)
-        admitted.sort(key=lambda r: (-r["similarity"], r["reaction_id"]))
+        admitted.sort(
+            key=lambda r: (
+                -int(r["spectator_complete"]),
+                -r["spectator_overlap"],
+                -r["similarity"],
+                r["reaction_id"],
+            )
+        )
         return admitted[:top_k], len(exact_ids & {r["reaction_id"] for r in admitted})
+
+    def find_stereoselective_cbyd_precedents(
+        self,
+        forward_smiles: str,
+        *,
+        top_k: int = 5,
+        mapped_reaction_smiles: str = "",
+    ) -> list[dict]:
+        """Return chemically admitted CbyD analogs with dr/ee/er annotations."""
+        if not self._cbyd_index_size:
+            return []
+        s = (forward_smiles or "").strip()
+        reactants, products = _parse_reaction_mols(s)
+        if not reactants or not products:
+            return []
+        delta = compute_rdkit_internal_delta_fg(s)
+        tiers = build_progressive_reaction_smarts(
+            s, "", mapped_reaction_smiles or ""
+        ) if products else []
+        product = Chem.MolFromSmiles(_extract_primary_smiles(s))
+        prod_conn = Chem.MolToInchiKey(product).split("-")[0] if product else ""
+        query_drfp = compute_drfp_bytes(s)
+        query_bits = int.from_bytes(compute_folded_rxn_fp(s) or b"", "big")
+        records, _ = self._query_cbyd_precedents(
+            s,
+            prod_conn,
+            tiers,
+            delta,
+            query_drfp,
+            query_bits,
+            top_k=max(50, int(top_k)),
+            stereoselective_only=True,
+        )
+        return [
+            {
+                "reaction_id": record["reaction_id"],
+                "similarity": round(float(record["similarity"]), 3),
+                "canonical_reaction": record.get("canonical_reaction", ""),
+                "catalysts": record.get("catalysts", ""),
+                "ligands": record.get("ligands", ""),
+                "solvents": record.get("solvents", ""),
+                "temperature": record.get("temperature", ""),
+                "yield_raw": record.get("yield_raw", ""),
+                "dr": record.get("dr", ""),
+                "ee": record.get("ee", ""),
+                "er": record.get("er", ""),
+                "doi": record.get("doi", ""),
+                "citation": record.get("citation", ""),
+                "missing_spectator_groups": record.get("missing_spectator_groups", []),
+                "tolerated_functional_groups": record.get("tolerated_functional_groups", []),
+            }
+            for record in records[: max(0, int(top_k))]
+        ]
 
     def batch_prefetch_online_ord(
         self,
@@ -745,7 +838,18 @@ class ORDRetrosynthesisValidator:
                 exact_hits += cbyd_exact_hits
                 analog_records.extend(cbyd_records)
 
-        analog_records.sort(key=lambda x: (-x["similarity"], -(x["yield_pct"] if x["yield_pct"] is not None else -1.0), x["ord_id"]))
+        analog_records.sort(
+            key=lambda x: (
+                -int(bool(
+                    x.get("provider") == "CbyD"
+                    and x.get("spectator_complete", False)
+                )),
+                -x.get("spectator_overlap", 0.0),
+                -x["similarity"],
+                -(x["yield_pct"] if x["yield_pct"] is not None else -1.0),
+                x["ord_id"],
+            )
+        )
         if analog_records:
             matched_smarts_label = analog_records[0]["matched_smarts_label"]
 

@@ -78,6 +78,14 @@ class StepClassificationItem(BaseModel):
     hazard_flags: List[str] = Field(default_factory=list)
     safer_alternatives: List[str] = Field(default_factory=list)
     data_gap_warnings: List[str] = Field(default_factory=list)
+    strategy_role: str = "bond_construction"
+    key_step_eligible: bool = True
+    key_step_exclusion: str = ""
+    stereochemical_changes: dict = Field(default_factory=dict)
+    stereochemical_control_risk: str = "None"
+    stereochemical_precedents: List[dict] = Field(default_factory=list)
+    chiral_pool_suggestions: List[str] = Field(default_factory=list)
+    chiral_auxiliary_suggestions: List[str] = Field(default_factory=list)
 
     @field_validator("safety_green_score", mode="before")
     @classmethod
