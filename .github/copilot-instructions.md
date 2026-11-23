@@ -9,9 +9,11 @@
 
 ## Repository Structure & Landmarks
 
-- `retroai/ord/fingerprints.py`: packed RDKit/DRFP reaction fingerprints, multiplicity-aware functional-group deltas, progressive SMARTS gates, and reaction-core/scaffold extraction.
+- `retroai/ord/fingerprints.py`: packed RDKit/DRFP reaction fingerprints, multiplicity-aware functional-group deltas, medicinal-chemistry family classification, progressive semantic/MCS SMARTS gates, and compact reaction-core extraction.
 - `retroai/ord/parser.py`: offline ORD protobuf normalization, salt stripping, spectator classification, and precomputed fingerprint/ΔFG features.
-- `retroai/ord/validator.py`: DuckDB schema migration/backfill, in-memory DRFP index, exact/DRFP/chemical validation funnel, chemoselective CbyD re-ranking, stereoselective precedent lookup, online ORD retrieval, and Hugging Face protobuf-shard ingestion.
+- `retroai/ord/validator.py`: DuckDB schema migration/backfill, refreshable dual ORD/CbyD DRFP indexes, exact/chemical validation, chemoselective CbyD re-ranking, stereoselective lookup, online diagnostics, and Hugging Face protobuf/Parquet ingestion.
+- `retroai/ai/classifier.py`: offline RDKit family classification, concrete unvalidated condition/stoichiometry baselines, ORD/CbyD enrichment, Gemini citation sanitization, and explicit scenario-yield planning.
+- `retroai/ui/workbench.py`: ORD/CbyD telemetry plus Colab callbacks, route rendering, and empirical/scenario-yield ELN scaling.
 - `retroai/cbyd/advisor.py`: CbyD-backed stereochemical-control risk analysis and curated chiral-pool/auxiliary suggestions.
 - `retroai/cbyd/parser.py`: CbyD step normalization, structured yield/condition parsing, spectator functional groups, and deterministic academic hazard flags.
 - `retroai/cbyd/ingest.py`: offline route JSON filtering/deduplication, `cbyd_reactions` persistence, and CbyD release metadata.

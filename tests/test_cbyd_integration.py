@@ -180,7 +180,7 @@ def test_validator_merges_strong_ord_and_cbyd_analog_sets(tmp_path, monkeypatch)
     routes = tmp_path / "routes"
     routes.mkdir()
     (routes / "cbyd.json").write_text(
-        json.dumps(_route("cbyd-dual", reaction, reagents=["TEMPO"])),
+        json.dumps(_route("cbyd-dual", "CCCO>>CCC=O", reagents=["TEMPO"])),
         encoding="utf-8",
     )
     ingest_cbyd_routes(routes, db_path, release_version="v2026.11")
@@ -189,6 +189,7 @@ def test_validator_merges_strong_ord_and_cbyd_analog_sets(tmp_path, monkeypatch)
 
     assert report["smarts_matched_count"] == 2
     assert {hit["provider"] for hit in report["top_precedents"]} == {"ORD", "CbyD"}
+    assert report["top_precedents"][0]["provider"] == "ORD"
 
 
 def test_complexity_key_steps_and_loop_penalties(monkeypatch):

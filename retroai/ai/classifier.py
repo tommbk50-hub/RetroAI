@@ -76,7 +76,9 @@ def _merge_step_stoichiometry(forward_smiles, ingredients, *, allow_defaults=Tru
     missing = [i for i in range(len(species)) if i not in assigned]
     if limiting is None and basis is not None and len(missing) == 1 and len(charges) == len(species):
         limiting = missing[0]  # The only unmatched substrate replaces the analog's limiting reactant.
-    if limiting is None:
+    if limiting is None and not charges and allow_defaults and species:
+        limiting = 0
+    elif limiting is None:
         additives = [dict(row, equivalents=0.0, molarity_m=0.0) for row in additives]
     rows = []
     for i, (smi, mw) in enumerate(species):
@@ -104,8 +106,8 @@ def _baseline_condition_profile(forward_smiles, signature=None):
             ("Greener amide coupling screen", "PyBOP (1.1 eq)", "DIPEA (3 eq)", "EtOAc or 2-MeTHF (0.20 M)", "20–40 °C, 4–16 h"),
         ),
         "esterification": (
-            ("Acid-catalyzed esterification", "Concentrated H2SO4 (5 mol%)", "Molecular sieves (optional)", "Alcohol as solvent or toluene (0.20 M)", "Reflux, 2–24 h"),
             ("DCC/DMAP esterification", "DCC (1.1 eq); DMAP (10 mol%)", "None additional", "DCM (0.20 M)", "0–25 °C, 2–12 h"),
+            ("Acid-catalyzed esterification", "Concentrated H2SO4 (5 mol%)", "Molecular sieves (optional)", "Alcohol as solvent or toluene (0.20 M)", "Reflux, 2–24 h"),
             ("EDC/DMAP esterification", "EDC·HCl (1.2 eq); DMAP (10 mol%)", "DIPEA (2 eq)", "EtOAc (0.20 M)", "20–40 °C, 4–16 h"),
         ),
         "saponification": (
@@ -172,28 +174,28 @@ def _baseline_condition_profile(forward_smiles, signature=None):
             "citation_or_ord_id": _USPTO_FG_SOURCE,
         })
 
-    def ingredient(name, role, smiles, equivalents=0.0, molarity=0.0):
+    def ingredient(name, role, smiles, equivalents=0.0, molarity=0.0, mw=None):
         mol = Chem.MolFromSmiles(smiles)
         return {
             "name": name, "role": role, "smiles_or_formula": Chem.MolToSmiles(mol) if mol else smiles,
-            "mw_g_mol": Descriptors.MolWt(mol) if mol else 0.0,
+            "mw_g_mol": mw if mw is not None else Descriptors.MolWt(mol) if mol else 0.0,
             "equivalents": equivalents, "molarity_m": molarity,
         }
 
     ingredients = {
         "amide_coupling": [
-            ingredient("HATU", "Base/Reagent", "CN(C)C(=N[P+](N(C)C)(N(C)C)N(C)C)c1nnnn1C)ON", 1.1),
+            ingredient("HATU", "Base/Reagent", "C10H15F6N6OP", 1.1, mw=380.23),
             ingredient("DIPEA", "Base/Reagent", "CCN(C(C)C)C(C)C", 3.0),
             ingredient("DMF", "Solvent", "CN(C)C=O", molarity=0.2),
         ],
         "suzuki": [
-            ingredient("Pd(PPh3)4", "Catalyst", "c1ccc(P(c2ccccc2)c2ccccc2)cc1", 0.03),
+            ingredient("Pd(PPh3)4", "Catalyst", "Pd(C18H15P)4", 0.03, mw=1155.56),
             ingredient("K3PO4", "Base/Reagent", "[O-]P(=O)([O-])[O-].[K+].[K+].[K+]", 3.0),
-            ingredient("1,4-dioxane", "Solvent", "C1COCCO1", molarity=0.2),
-            ingredient("water", "Solvent", "O", molarity=0.2),
+            ingredient("1,4-dioxane", "Solvent", "C1COCCO1", molarity=0.25),
+            ingredient("water", "Solvent", "O", molarity=1.0),
         ],
         "aryl_amination": [
-            ingredient("Pd2(dba)3", "Catalyst", "O=C(/C=C/c1ccccc1)/C=C/c1ccccc1.[Pd]", 0.02),
+            ingredient("Pd2(dba)3", "Catalyst", "C51H42O3Pd2", 0.02, mw=915.72),
             ingredient("XPhos", "Ligand", "CC(C)c1cc(C(C)C)c(-c2ccccc2P(C2CCCCC2)C2CCCCC2)c(C(C)C)c1", 0.04),
             ingredient("Cs2CO3", "Base/Reagent", "[Cs+].[Cs+].[O-]C([O-])=O", 2.0),
             ingredient("1,4-dioxane", "Solvent", "C1COCCO1", molarity=0.2),
@@ -207,13 +209,14 @@ def _baseline_condition_profile(forward_smiles, signature=None):
             ingredient("MeOH", "Solvent", "CO", molarity=0.2),
         ],
         "esterification": [
+            ingredient("DCC", "Base/Reagent", "C1CCC(CC1)N=C=NC2CCCCC2", 1.1),
             ingredient("DMAP", "Catalyst", "CN(C)c1ccncc1", 0.1),
             ingredient("DCM", "Solvent", "ClCCl", molarity=0.2),
         ],
         "saponification": [
             ingredient("LiOH", "Base/Reagent", "[Li+].[OH-]", 3.0),
-            ingredient("THF", "Solvent", "C1CCOC1", molarity=0.2),
-            ingredient("water", "Solvent", "O", molarity=0.2),
+            ingredient("THF", "Solvent", "C1CCOC1", molarity=0.8 / 3),
+            ingredient("water", "Solvent", "O", molarity=0.8),
         ],
     }[family]
     name = _REACTION_FAMILY_NAMES[family]
@@ -670,24 +673,50 @@ def batch_classify_with_gemini(
                 info["source_doi_or_patent"] = ""
                 source = ""
             if not source or source not in set(contexts[smi]["procedure_sources"]):
-                info["experimental_procedure"] = ""
+                info["experimental_procedure"] = (
+                    ""
+                    if results[smi]["ord_validation"].get("smarts_matched_count")
+                    else results[smi].get("experimental_procedure", "")
+                )
             baseline_conditions = {
                 row["rank"]: row for row in results[smi]["ranked_conditions"]
             }
+            evidence_by_citation = {
+                row["citation_or_ord_id"].strip(): row
+                for row in results[smi]["ranked_conditions"]
+                if row.get("citation_or_ord_id")
+            }
+            if re.fullmatch(
+                r"\s*(?:\d+(?:\.\d+)?\s*)?(?:unclassified|unrecognized|unknown|synthetic transformation)?\s*",
+                info["reaction_name"],
+                flags=re.I,
+            ):
+                info["reaction_name"] = results[smi]["reaction_name"]
             for condition in info["ranked_conditions"]:
                 condition["citation_or_ord_id"] = condition["citation_or_ord_id"].strip()
                 if (
                     condition["citation_or_ord_id"] not in allowed
                     and condition["citation_or_ord_id"] != _USPTO_FG_SOURCE
                 ):
-                    condition["citation_or_ord_id"] = baseline_conditions[condition["rank"]]["citation_or_ord_id"]
-                    condition["expected_yield_range"] = baseline_conditions[condition["rank"]]["expected_yield_range"]
+                    baseline = baseline_conditions[condition["rank"]]
+                    if results[smi]["ord_validation"].get("smarts_matched_count"):
+                        condition.update(baseline)
+                    else:
+                        condition["citation_or_ord_id"] = baseline["citation_or_ord_id"]
+                        condition["expected_yield_range"] = baseline["expected_yield_range"]
+                elif condition["citation_or_ord_id"] in evidence_by_citation:
+                    requested_rank = condition["rank"]
+                    condition.update(evidence_by_citation[condition["citation_or_ord_id"]])
+                    condition["rank"] = requested_rank
                 if not results[smi]["ord_validation"].get("smarts_matched_count"):
                     baseline = baseline_conditions[condition["rank"]]
                     condition["citation_or_ord_id"] = _USPTO_FG_SOURCE
                     condition["expected_yield_range"] = baseline["expected_yield_range"]
+                else:
+                    condition["expected_yield_range"] = baseline_conditions[condition["rank"]]["expected_yield_range"]
                 if condition["citation_or_ord_id"] == _USPTO_FG_SOURCE:
-                    condition["condition_label"] = "Unvalidated proposal: " + condition["condition_label"]
+                    if not condition["condition_label"].startswith("Unvalidated"):
+                        condition["condition_label"] = "Unvalidated proposal: " + condition["condition_label"]
             baseline_cbyd_conditions = {
                 condition["citation_or_ord_id"]: condition
                 for condition in results[smi]["ranked_conditions"]
@@ -714,9 +743,14 @@ def batch_classify_with_gemini(
             )
             info["assumed_step_yield"] = results[smi]["assumed_step_yield"]
             info["scenario_step_yield"] = results[smi].get("scenario_step_yield")
+            stoichiometry_source = (
+                results[smi]["reagent_stoichiometry"]
+                if results[smi]["ord_validation"].get("smarts_matched_count")
+                else info["reagent_stoichiometry"]
+            )
             info["reagent_stoichiometry"] = _merge_step_stoichiometry(
                 smi,
-                info["reagent_stoichiometry"],
+                stoichiometry_source,
                 allow_defaults=(
                     next(iter(results[smi]["ord_validation"].get("top_precedents") or []), {}).get("provider")
                     != "CbyD"

@@ -1100,7 +1100,7 @@ def _render_workbench(ord_validator: ORDRetrosynthesisValidator):
           <div class="cf-cfg-item">
             <label>ORD Parquet Shards (`ord-data` HF)</label>
             <div style="display:flex;gap:4px;align-items:center;">
-              <button id="cf-ord-sync-btn" class="cf-btn" style="padding:4px 8px;font-size:10.5px;width:100%;" onclick="cfSyncOrdShards(1)" title="Stream &amp; index an ORD .parquet shard from Hugging Face into /dev/shm DuckDB">📥 Sync +1 HF ORD Parquet Shard</button>
+              <button id="cf-ord-sync-btn" class="cf-btn" style="padding:4px 8px;font-size:10.5px;width:100%;" onclick="cfSyncOrdShards(1)" title="Stream &amp; index an ORD protobuf or Parquet shard from Hugging Face into local data/ DuckDB">📥 Sync +1 HF ORD Shard</button>
             </div>
           </div>
           <div class="cf-cfg-item" style="display:flex;flex-direction:column;justify-content:center;gap:4px;">
@@ -1280,7 +1280,7 @@ async function cfSyncOrdShards(nShards) {{
   const btn = document.getElementById("cf-ord-sync-btn");
   if (btn) {{
     btn.disabled = true;
-    btn.innerText = "⏳ Streaming HF Parquet Shard...";
+    btn.innerText = "⏳ Streaming HF ORD Shard...";
   }}
   try {{
     const res = await google.colab.kernel.invokeFunction("chemforge.sync_ord_shards", [nShards || 1], {{}});
@@ -1813,7 +1813,7 @@ class _Workbench:
 
 
     def _cb_sync_ord_shards(self, num_shards: int = 1):
-        """Streams ORD protobuf shards from Hugging Face into the DuckDB index and updates UI badge."""
+        """Streams ORD protobuf/Parquet shards into the active DuckDB index and updates UI."""
         getattr(self.ord_validator, "refresh_index", lambda: None)()
         info = self.ord_validator.sync_huggingface_parquet_shards(
             max_shards=int(num_shards), route_steps=self.state.active_route_steps()

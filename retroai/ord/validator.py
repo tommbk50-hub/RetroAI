@@ -90,11 +90,76 @@ def _submit_and_poll_ord_session(
     poll_interval: float = 0.25,
 ) -> List[bytes]:
     """
-    Thread-safe asynchronous query submission and polling against https://open-reaction-database.org/api
-    using the shared connection-pooled HTTP session.
+    Query the current synchronous ORD viewer API, with legacy submit/poll fallback.
     """
     deadline = time.time() + timeout_sec
     try:
+        components = [
+            (value.rsplit(";", 2)[0], side)
+            for key, value in params
+            if key == "component" and ";" in value
+            for side in [value.rsplit(";", 2)[1]]
+            if side in {"input", "output"}
+        ]
+        threshold = float(next(
+            (value for key, value in params if key == "similarity"), 0.4
+        ))
+        limit = int(next((value for key, value in params if key == "limit"), 20))
+        clauses = [
+            {
+                "op": "exists",
+                "path": "outcomes.products" if side == "output" else "inputs.components",
+                "where": {
+                    "op": "similarity",
+                    "path": "smiles",
+                    "smiles": smiles,
+                    "threshold": threshold,
+                },
+            }
+            for smiles, side in components
+            if smiles
+        ]
+        if clauses:
+            where = clauses[0] if len(clauses) == 1 else {
+                "op": "and",
+                "clauses": clauses,
+            }
+            search_resp = _ORD_HTTP_SESSION.post(
+                f"{ORD_ONLINE_API_BASE}/search",
+                json={"query": {"where": where, "limit": max(1, min(limit, 100))}},
+                timeout=min(6.0, max(1.0, timeout_sec)),
+            )
+            if search_resp.status_code == 200:
+                result = search_resp.json()
+                reaction_ids = result.get("reaction_ids") or [] if isinstance(result, dict) else []
+                if not reaction_ids:
+                    return []
+                fetch_resp = _ORD_HTTP_SESSION.get(
+                    f"{ORD_ONLINE_API_BASE}/reactions",
+                    params=[("id", reaction_id) for reaction_id in reaction_ids[:limit]],
+                    timeout=min(6.0, max(1.0, timeout_sec)),
+                )
+                if fetch_resp.status_code != 200:
+                    raise RuntimeError(
+                        f"ORD reaction fetch returned HTTP {fetch_resp.status_code}"
+                    )
+                records = fetch_resp.json()
+                if not isinstance(records, list):
+                    raise RuntimeError("ORD reaction fetch result was not a list")
+                out = []
+                for record in records:
+                    encoded = record.get("binpb") if isinstance(record, dict) else None
+                    if not encoded:
+                        continue
+                    try:
+                        out.append(base64.b64decode(encoded, validate=True))
+                    except Exception:
+                        logging.warning("Dropping malformed binpb from current ORD reaction API")
+                return out
+            if search_resp.status_code not in (404, 405):
+                raise RuntimeError(f"ORD search returned HTTP {search_resp.status_code}")
+
+        # Legacy installations used asynchronous /submit_query and /fetch_query_result.
         sub_resp = _ORD_HTTP_SESSION.get(
             f"{ORD_ONLINE_API_BASE}/submit_query",
             params=params,
@@ -146,8 +211,11 @@ def _submit_and_poll_ord_session(
                     if b64_proto:
                         try:
                             out_protos.append(base64.b64decode(b64_proto, validate=True))
-                        except Exception as exc:
-                            logging.warning("Dropping malformed base64 ORD result: %s", type(exc).__name__)
+                        except Exception:
+                            try:
+                                out_protos.append(base64.b64decode(str(b64_proto).encode()))
+                            except Exception as exc:
+                                logging.warning("Dropping malformed base64 ORD result: %s", type(exc).__name__)
                 return out_protos
             elif poll_resp.status_code in (202, 404):
                 time.sleep(poll_interval)
@@ -178,10 +246,10 @@ def _fetch_step_ord_records_worker(
     react_s, prod_s = [p.strip() for p in s.split(">>", 1)]
     r_list = [x.strip() for x in react_s.split(".") if x.strip()]
     p_smi = _extract_primary_smiles(prod_s)
-    if not p_smi:
+    if not r_list or not p_smi:
         return []
-    if not core_reactant:
-        core_reactant = _rdkit_extract_reacting_cores(s)["core_reactant"]
+    core_reactant = core_reactant or max(r_list, key=len)
+    core_product = core_product or p_smi
 
     t0 = time.time()
     output_core = core_product or p_smi
@@ -219,8 +287,13 @@ def _fetch_step_ord_records_worker(
 
 
 def _parse_parquet_ord_row(row: dict, admit=None) -> Optional[dict]:
-    for key in ("proto", "protobuf", "reaction_proto", "serialized", "reaction"):
+    for key in ("binpb", "proto", "protobuf", "reaction_binpb", "reaction_proto", "serialized", "reaction"):
         payload = row.get(key)
+        if isinstance(payload, str) and payload:
+            try:
+                payload = base64.b64decode(payload, validate=True)
+            except Exception:
+                payload = None
         if isinstance(payload, (bytes, bytearray, memoryview)):
             try:
                 reaction = ord_reaction_pb2.Reaction()
@@ -250,11 +323,16 @@ def _parse_parquet_ord_row(row: dict, admit=None) -> Optional[dict]:
         return None
     diff_fp = compute_rxn_center_diff_fp(raw_rxn)
     consumed, formed, _ = compute_rdkit_internal_delta_fg(raw_rxn)
-    try:
-        yield_pct = float(row.get("yield_pct"))
-    except (TypeError, ValueError):
-        yield_pct = None
+    def optional_float(key):
+        try:
+            value = float(row.get(key))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return value if np.isfinite(value) else None
+
+    yield_pct = optional_float("yield_pct")
     condition = lambda key, fallback: str(row.get(key) or fallback)
+    stoichiometry = _json_value(row.get("condition_stoichiometry"), [])
     return {
         "ord_id": reaction_id,
         "rxn_smiles": raw_rxn,
@@ -264,7 +342,7 @@ def _parse_parquet_ord_row(row: dict, admit=None) -> Optional[dict]:
         "catalysts": condition("catalysts", "None"),
         "reagents": condition("reagents", "None"),
         "solvents": condition("solvents", "Unspecified"),
-        "temp_c": float(row["temp_c"]) if row.get("temp_c") is not None else None,
+        "temp_c": optional_float("temp_c"),
         "atmosphere": condition("atmosphere", "UNSPECIFIED"),
         "undesired_byproducts": condition("undesired_byproducts", "None"),
         "reference": condition("reference", f"ORD ({reaction_id})"),
@@ -276,8 +354,8 @@ def _parse_parquet_ord_row(row: dict, admit=None) -> Optional[dict]:
         "procedure_details": condition("procedure_details", ""),
         "doi": condition("doi", ""),
         "patent_id": condition("patent_id", ""),
-        "condition_stoichiometry": condition("condition_stoichiometry", "[]"),
-        "duration_h": row.get("duration_h"),
+        "condition_stoichiometry": json.dumps(stoichiometry),
+        "duration_h": optional_float("duration_h"),
     }
 
 
@@ -433,9 +511,11 @@ class ORDRetrosynthesisValidator:
         self._index_db_token = self._database_token()
 
     def get_index_size(self) -> int:
+        self._ensure_index_current()
         return self._index_size
 
     def get_cbyd_index_size(self) -> int:
+        self._ensure_index_current()
         return self._cbyd_index_size
 
     def _database_token(self) -> tuple:
@@ -645,6 +725,7 @@ class ORDRetrosynthesisValidator:
           2. Fires concurrent HTTP queries via ThreadPoolExecutor (up to 16 threads)
           3. Commits all newly discovered Reaction records in one DuckDB transaction
         """
+        self._ensure_index_current()
         specs = _ord_gate_specs(forward_smiles_list, route_steps)
         if not specs:
             return {
@@ -792,6 +873,7 @@ class ORDRetrosynthesisValidator:
                                         custom_smarts_list: Optional[List[str]] = None,
                                         forward_smiles_list: Optional[List[str]] = None, *, route_steps=None) -> dict:
         """Index bounded ORD protobuf shards, filtering to the active steps when available."""
+        self._ensure_index_current()
         gates = [(build_progressive_reaction_smarts(smi, template, mapped), compute_rdkit_internal_delta_fg(smi))
                  for smi, template, mapped in _ord_gate_specs(forward_smiles_list, route_steps) if _parse_reaction_mols(smi)[0]]
         custom_smarts = tuple(sorted(set(custom_smarts_list or [])))
@@ -831,6 +913,7 @@ class ORDRetrosynthesisValidator:
 
         con = duckdb.connect(self.db_path)
         added_total = 0
+        parse_drops = 0
         for shard in target_shards:
             try:
                 local_path = hf_hub_download(repo_id=repo_id, filename=shard, repo_type="dataset", token=token)
@@ -845,11 +928,20 @@ class ORDRetrosynthesisValidator:
                 for idx, rxn in enumerate(rxn_iter or []):
                     if idx >= max_reactions_per_shard:
                         break
-                    parsed = (
-                        _parse_parquet_ord_row(rxn, admit=admit)
-                        if shard.endswith(".parquet")
-                        else parse_ord_reaction_protobuf(rxn, admit=admit)
-                    )
+                    try:
+                        parsed = (
+                            _parse_parquet_ord_row(rxn, admit=admit)
+                            if shard.endswith(".parquet")
+                            else parse_ord_reaction_protobuf(rxn, admit=admit)
+                        )
+                    except Exception as exc:
+                        parse_drops += 1
+                        logging.warning(
+                            "Dropping one ORD shard row from %s after %s",
+                            shard,
+                            type(exc).__name__,
+                        )
+                        continue
                     if parsed:
                         records[parsed["ord_id"]] = parsed
                 if records:
@@ -868,6 +960,7 @@ class ORDRetrosynthesisValidator:
             "added": added_total,
             "indexed_count": self.get_index_size(),
             "shards_loaded": len(self._loaded_shards),
+            "parse_drops": parse_drops,
         }
 
     def validate_step(self, forward_smiles: str, top_k: int = 3, *, template_info=None) -> dict:
@@ -996,12 +1089,16 @@ class ORDRetrosynthesisValidator:
 
         analog_records.sort(
             key=lambda x: (
-                -int(bool(
-                    x.get("provider") == "CbyD"
-                    and x.get("spectator_complete", False)
-                )),
-                -x.get("spectator_overlap", 0.0),
-                -x["similarity"],
+                -min(
+                    1.0,
+                    x["similarity"]
+                    + (
+                        0.025 * int(bool(x.get("spectator_complete")))
+                        + 0.05 * float(x.get("spectator_overlap") or 0.0)
+                    )
+                    if x.get("provider") == "CbyD"
+                    else x["similarity"],
+                ),
                 -(x["yield_pct"] if x["yield_pct"] is not None else -1.0),
                 x["ord_id"],
             )
@@ -1145,7 +1242,9 @@ class ORDRetrosynthesisValidator:
                         if (r.get("reference") or "").startswith("Patent: ")
                         else ""
                     ),
-                    "reagent_stoichiometry": json.loads(r.get("condition_stoichiometry") or "[]"),
+                    "reagent_stoichiometry": _json_value(
+                        r.get("condition_stoichiometry"), []
+                    ),
                     "duration_h": r.get("duration_h"),
                 }
                 for r in analog_records[:top_k]

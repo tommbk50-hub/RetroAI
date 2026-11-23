@@ -1,4 +1,5 @@
 import gzip
+import base64
 import json
 from types import SimpleNamespace
 
@@ -256,6 +257,42 @@ def test_validator_indexes_a_local_ord_shard_and_filters_precedents(tmp_path, mo
     assert validator.score_route([OXIDATION], step_reports=[report])["ord_mean_yield_pct"] == 72.0
 
 
+def test_validator_indexes_flat_huggingface_ord_parquet(tmp_path, monkeypatch):
+    shard = tmp_path / "ord-flat.parquet"
+    with duckdb.connect() as con:
+        con.execute(
+            f"""
+            COPY (
+                SELECT 'ord-parquet-oxidation' AS reaction_id,
+                       '{OXIDATION}' AS reaction_smiles,
+                       74.0 AS yield_pct,
+                       'TEMPO' AS reagents,
+                       'MeCN' AS solvents,
+                       'overnight' AS duration_h,
+                       'not-json' AS condition_stoichiometry
+            ) TO '{shard}' (FORMAT PARQUET)
+            """
+        )
+    monkeypatch.setattr(
+        ord_validator, "list_repo_files", lambda **kwargs: [shard.name]
+    )
+    monkeypatch.setattr(ord_validator, "hf_hub_download", lambda **kwargs: shard)
+    validator = ord_validator.ORDRetrosynthesisValidator(tmp_path / "parquet.duckdb")
+
+    stats = validator.sync_huggingface_parquet_shards(
+        route_steps=[{"forward_smiles": OXIDATION, "retro_template": RETRO_TEMPLATE}]
+    )
+    report = validator.validate_step(
+        OXIDATION, template_info={"retro_template": RETRO_TEMPLATE}
+    )
+
+    assert stats["added"] == 1
+    assert report["top_precedents"][0]["ord_id"] == "ord-parquet-oxidation"
+    assert report["top_precedents"][0]["reagents"] == "TEMPO"
+    assert report["top_precedents"][0]["duration_h"] is None
+    assert report["top_precedents"][0]["reagent_stoichiometry"] == []
+
+
 def test_legacy_database_migrates_and_backfills_ord_features(tmp_path):
     db_path = tmp_path / "legacy.duckdb"
     record = _ord_record("legacy-oxidation", OXIDATION, 68)
@@ -467,6 +504,46 @@ def test_online_ord_uses_largest_reactant_and_scaffold_fallback(monkeypatch):
     assert requests[1]["similarity"] == "0.30"
 
 
+def test_current_ord_api_uses_search_then_reaction_batch(monkeypatch):
+    reaction = reaction_pb2.Reaction(reaction_id="ord-current-api")
+    seen = {}
+
+    class Response:
+        def __init__(self, payload, status_code=200):
+            self._payload = payload
+            self.status_code = status_code
+
+        def json(self):
+            return self._payload
+
+    def post(url, json, **kwargs):
+        seen["url"] = url
+        seen["query"] = json["query"]
+        return Response({"kind": "reactions", "reaction_ids": ["ord-current-api"]})
+
+    def get(url, params, **kwargs):
+        assert list(params) == [("id", "ord-current-api")]
+        return Response([{
+            "reaction_id": "ord-current-api",
+            "binpb": base64.b64encode(reaction.SerializeToString()).decode(),
+        }])
+
+    monkeypatch.setattr(
+        ord_validator, "_ORD_HTTP_SESSION", SimpleNamespace(post=post, get=get)
+    )
+    protos = ord_validator._submit_and_poll_ord_session([
+        ("component", "NCc1ccccc1;output;similarity"),
+        ("component", "BrCc1ccccc1;input;similarity"),
+        ("similarity", "0.35"),
+        ("limit", "10"),
+    ])
+
+    assert seen["url"].endswith("/api/search")
+    assert seen["query"]["limit"] == 10
+    assert seen["query"]["where"]["op"] == "and"
+    assert protos == [reaction.SerializeToString()]
+
+
 def test_padded_reaction_uses_harvested_template_and_preserves_input_key(tmp_path):
     validator = ord_validator.ORDRetrosynthesisValidator(tmp_path / "ord.duckdb")
     state = WorkbenchState(step_templates={
@@ -534,12 +611,63 @@ def test_gemini_preserves_unvalidated_classification_without_fake_evidence(tmp_p
     assert result["gemini_enriched"]
     assert result["reaction_name"] == "Amide bond formation"
     assert result["assumed_step_yield"] is None
-    assert result["experimental_procedure"] == ""
+    assert "Unvalidated planning draft" in result["experimental_procedure"]
     assert result["source_doi_or_patent"] == ""
     assert all(row["citation_or_ord_id"] == "USPTO/ΔFG Standard"
                for row in result["ranked_conditions"])
     assert all("reported" not in row["expected_yield_range"].lower()
                for row in result["ranked_conditions"])
+
+
+def test_gemini_cannot_rewrite_verified_ord_condition_values(tmp_path, monkeypatch):
+    validator = ord_validator.ORDRetrosynthesisValidator(tmp_path / "citation.duckdb")
+    record = _ord_record("ord-trusted", OXIDATION, 72)
+    record.update(
+        reagents="DMP",
+        solvents="DCM",
+        temp_c=20.0,
+        duration_h=3.0,
+    )
+    _insert_ord_record(validator, record)
+    baseline = classifier.rdkit_classify_step(
+        OXIDATION,
+        template_info={"retro_template": RETRO_TEMPLATE},
+        ord_validator=validator,
+    )
+    proposed = json.loads(json.dumps(baseline))
+    primary = proposed["ranked_conditions"][0]
+    primary.update(
+        catalyst_and_ligand="invented catalyst",
+        base_or_reagent="invented base",
+        solvent_and_molarity="invented solvent",
+        temp_and_time="invented temperature",
+    )
+    proposed["ranked_conditions"][1]["citation_or_ord_id"] = primary[
+        "citation_or_ord_id"
+    ]
+    response = SimpleNamespace(text=json.dumps({"steps": [proposed]}))
+    monkeypatch.setattr(classifier, "get_gemini_client", object)
+    monkeypatch.setattr(classifier, "fetch_verified_literature_dois", lambda *args: [])
+    monkeypatch.setattr(
+        classifier, "call_gemini_with_config",
+        lambda **kwargs: (response, "test-model", "medium"),
+    )
+
+    result = classifier.batch_classify_with_gemini(
+        [OXIDATION],
+        step_templates={OXIDATION: {"retro_template": RETRO_TEMPLATE}},
+        state=WorkbenchState(),
+        ord_validator=validator,
+    )[OXIDATION]
+    primary = result["ranked_conditions"][0]
+
+    assert primary["base_or_reagent"] == "DMP"
+    assert primary["solvent_and_molarity"] == "DCM"
+    assert "20 °C" in primary["temp_and_time"]
+    assert "invented" not in " ".join(
+        value for value in primary.values() if isinstance(value, str)
+    ).lower()
+    assert [row["rank"] for row in result["ranked_conditions"]] == [1, 2, 3]
 
 
 def test_pipeline_applies_templates_and_lab_stock_without_leaking_canvas_locks(tmp_path, monkeypatch):
