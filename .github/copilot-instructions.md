@@ -38,29 +38,33 @@ Before finishing any task or opening a PR that adds, renames, moves, or deletes 
   - Cell 2: `2. Launch the workbench`
 - `retroai/__init__.py`
 - `retroai/ai/__init__.py`
-- `retroai/ai/classifier.py` — `def _merge_step_stoichiometry()`, `def _ranked_ord_conditions()`, `def _condition_items()`, `def _cbyd_precedents()`, `def _fg_search_terms()`, `def _step_transformation_keywords()`, `def rdkit_classify_step()`, `def _match_rdkit_rule()`
+- `retroai/ai/classifier.py` — `def _merge_step_stoichiometry()`, `def _ranked_ord_conditions()`, `def _condition_items()`, `def _cbyd_precedents()`, `def _fg_search_terms()`, `def _step_transformation_keywords()`, `def _has_new_cyclic_protecting_group()`, `def classify_step_strategy_role()`
 - `retroai/ai/gemini_client.py` — `def _with_evidence_guardrails()`, `def get_gemini_client()`, `def _build_genai_config()`, `def call_gemini_with_config()`
 - `retroai/ai/literature.py` — `def _clean_doi()`, `def _literature_snippet()`, `def cbyd_precedent_literature()`, `def _verify_doi_metadata()`, `def fetch_verified_literature_dois()`
 - `retroai/cbyd/__init__.py`
+- `retroai/cbyd/advisor.py` — `def _catalog_patterns()`, `def _catalog_matches()`, `def _has_chiral_control()`, `def advise_stereochemical_control()`
 - `retroai/cbyd/ingest.py` — `def ensure_cbyd_schema()`, `def _collect_route_tree_flags()`, `def ingest_cbyd_routes()`, `def main()`
 - `retroai/cbyd/parser.py` — `def _spectator_salt_keys()`, `def _as_list()`, `def _condition_text()`, `def parse_yield_fields()`, `def _standardize_reaction()`, `def assess_condition_hazards()`, `def parse_cbyd_step()`
 - `retroai/core/__init__.py`
-- `retroai/core/chem_utils.py` — `def _extract_primary_smiles()`, `def _canonical_molecule_smiles()`, `def _compute_descriptors_and_ro5()`, `def mol_or_rxn_to_svg_html()`, `def rdkit_enumerate_byproducts()`, `def rdkit_predict_lcms_ions()`, `def rdkit_predict_workup_properties()`
+- `retroai/core/chem_utils.py` — `def _extract_primary_smiles()`, `def _canonical_molecule_smiles()`, `def _sascore_calculator()`, `def _spacial_score_calculator()`, `def _mol_from_smiles_or_mol()`, `def rdkit_calculate_sascore()`, `def rdkit_calculate_spacial_score()`, `def _reaction_side_mols()`
 - `retroai/core/config.py` — `def get_secret()`, `def set_active_genai_settings()`, `def get_process_ram_mb()`
 - `retroai/core/resolver.py` — `def _resolve_chemical_identifier()`
 - `retroai/core/schemas.py` — `def _clamp_safety_score()`, `def _clamp_step_yield()`, `class RankedConditionSet`, `class ReagentStoichItem`, `class CbyDPrecedent`, `class StepClassificationItem`, `class StepClassificationBatch`, `class StrategySummary`
 - `retroai/core/state.py` — `def _default_search_params()`, `class WorkbenchState`
 - `retroai/engine/__init__.py`
-- `retroai/engine/aizynth.py` — `def get_finder()`, `def _harvest_uspto_templates_from_finder()`, `def _flatten_reaction_tree()`, `def cleanup_aizynth_memory()`, `def register_custom_lab_stock()`
-- `retroai/engine/pipeline.py` — `def deduplicate_retro_state()`, `def compute_composite_route_score()`, `def run_retrosynthesis_pipeline()`
+- `retroai/engine/aizynth.py` — `def _common_lab_reagent_keys()`, `def is_common_lab_reagent()`, `def configure_finder_runtime_stock()`, `def get_finder()`, `def _harvest_uspto_templates_from_finder()`, `def _flatten_reaction_tree()`, `def cleanup_aizynth_memory()`, `def register_custom_lab_stock()`
+- `retroai/engine/pipeline.py` — `def _longest_linear_step_indices()`, `def _organic_reaction_endpoints()`, `def detect_unproductive_loops()`, `def annotate_route_strategy()`, `def deduplicate_retro_state()`, `def compute_composite_route_score()`, `def run_retrosynthesis_pipeline()`
 - `retroai/ord/__init__.py`
 - `retroai/ord/fingerprints.py` — `def compute_folded_rxn_fp()`, `def compute_drfp_bytes()`, `def tanimoto_packed_fp_batch()`, `def compute_rxn_center_diff_fp()`, `def _load_smartsrx_data()`, `def _build_rdkit_internal_fg_catalog()`, `def _parse_reaction_mols()`, `def compute_rdkit_internal_delta_fg()`
 - `retroai/ord/parser.py` — `def _ord_enum_name()`, `def _safe_compound_smiles()`, `def _canonical_component_smiles()`, `def _standardize_primary_smiles()`, `def _known_spectator_role()`, `def _smiles_to_english_name()`, `def _humanize_condition_list()`, `def _safe_compound_name()`
 - `retroai/ord/validator.py` — `def _ord_gate_specs()`, `def _counter_from_json()`, `def _delta_cache_key()`, `def _json_value()`, `def _submit_and_poll_ord_session()`, `def _fetch_step_ord_records_worker()`, `class ORDRetrosynthesisValidator`, `def get_ord_validator()`
 - `retroai/ui/__init__.py`
 - `retroai/ui/ketcher.py` — `class _QuietHandler`, `def _ensure_ketcher_bundle()`
-- `retroai/ui/workbench.py` — `def _scale_route_eln()`, `def _eln_step_rows()`, `def _eln_step_text()`, `def _render_eln_step_html()`, `def _generate_strategy_header()`, `def _enrich_route_for_chemforge()`, `def _render_step_source()`, `def _render_ord_step_panel_html()`
+- `retroai/ui/workbench.py` — `def _scale_route_eln()`, `def _eln_step_rows()`, `def _eln_step_text()`, `def _render_eln_step_html()`, `def _generate_strategy_header()`, `def _enrich_route_for_chemforge()`, `def _render_complexity_sparkline_html()`, `def _render_step_source()`
+- `tests/benchmarks/benchmark_cbyd.py` — `def load_route_tree_jsonl()`, `def _walk()`, `def _record_label()`, `def _target_smiles()`, `def _molecule_smiles()`, `def _intermediate_smiles()`, `def _is_convergent()`, `def _selected_record()`
+- `tests/conftest.py` — `def pytest_addoption()`, `def pytest_configure()`
 - `tests/test_cbyd.py` — `def _route()`, `def test_yield_parser_preserves_telescoped_and_selectivity_fields()`, `def test_cbyd_standardization_strips_salt_and_tracks_mapped_survival()`, `def test_cbyd_ingestion_deduplicates_filters_and_records_metadata()`, `def test_ingestion_uses_route_tree_reachability_and_rejects_bad_jsonl()`, `def test_validator_rescues_step_with_cbyd_without_counting_telescoped_yield()`
+- `tests/test_cbyd_integration.py` — `def _route()`, `def _step()`, `def test_route_tree_schema_and_cbyd_json_ingestion()`, `def test_stereoselective_yield_fields_and_chemoselective_reranking()`, `def test_complexity_key_steps_and_loop_penalties()`, `def test_stereochemical_creation_is_detected_and_flagged()`, `def test_common_lab_reagent_allowlist_is_opt_in_and_canonical()`
 - `tests/test_chem_utils.py` — `def test_extract_primary_smiles()`, `def test_descriptors_use_the_primary_product()`, `def test_byproducts_include_deduplicated_product_and_predicted_impurity()`, `def test_lcms_adducts_and_bromine_isotope_note()`, `def test_workup_properties_compare_product_to_reactants()`
 - `tests/test_ord_validator.py` — `def _ord_record()`, `def _insert_ord_record()`, `def offline_fg_catalog()`, `def test_internal_delta_fg_reports_lost_alcohol_and_formed_aldehyde()`, `def test_drfp_and_vectorized_packed_tanimoto_are_exact()`, `def test_delta_fg_preserves_multiplicity_and_does_not_veto_carboxylates()`, `def test_progressive_smarts_tries_exact_template_before_mcs()`, `def test_ord_gate_prefers_smarts_then_delta_and_rejects_competing_electrophiles()`
 - `tests/test_runtime.py` — `def test_headless_imports_do_not_initialize_data_services()`, `def test_onnx_session_patch_enforces_memory_options()`, `def test_get_secret_uses_environment_without_colab()`, `def test_workbench_registers_the_callbacks_used_by_the_frontend()`, `def test_agent_reply_preserves_only_plain_formatting_tags()`
