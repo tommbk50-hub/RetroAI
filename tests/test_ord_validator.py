@@ -11,6 +11,7 @@ from retroai.ai import classifier
 from retroai.core.state import WorkbenchState
 from retroai.engine import aizynth, pipeline
 from retroai.ord import fingerprints, parser as ord_parser, validator as ord_validator
+from retroai.ui import workbench
 from ord_schema.proto import dataset_pb2, reaction_pb2
 
 
@@ -91,6 +92,25 @@ def test_delta_fg_preserves_multiplicity_and_does_not_veto_carboxylates():
     assert "fr_COO" not in fingerprints._COMPETING_ELECTROPHILES
 
 
+def test_aromatic_acid_amine_coupling_has_concrete_unvalidated_fallback(tmp_path):
+    forward = "O=C(O)c1ccccc1.Nc1cc(C(F)(F)F)ccc1>>O=C(Nc1cc(C(F)(F)F)ccc1)c1ccccc1"
+    validator = ord_validator.ORDRetrosynthesisValidator(tmp_path / "amide.duckdb")
+
+    report = validator.validate_step(forward)
+    classified = classifier.rdkit_classify_step(forward, ord_validator=validator)
+
+    assert report["matched_smarts_label"] == "No verified match (Unvalidated)"
+    assert classified["reaction_name"] == "Amide coupling"
+    assert classified["scenario_step_yield"] == 0.5
+    assert classified["assumed_step_yield"] is None
+    assert "HATU" in classified["typical_conditions"]
+    assert all("Not reported" not in value for row in classified["ranked_conditions"]
+               for value in row.values() if isinstance(value, str))
+    assert all(row["citation_or_ord_id"] == "USPTO/ΔFG Standard"
+               for row in classified["ranked_conditions"])
+    assert "Unvalidated" in classified["experimental_procedure"]
+
+
 def test_progressive_smarts_tries_exact_template_before_mcs():
     tiers = fingerprints.build_progressive_reaction_smarts(OXIDATION, RETRO_TEMPLATE)
     assert [tier["tier"] for tier in tiers] == [1, 2, 3]
@@ -105,7 +125,9 @@ def test_ord_gate_prefers_smarts_then_delta_and_rejects_competing_electrophiles(
     assert fingerprints._match_ord_gate(reactants, products, delta, tiers, delta) == (
         tiers[0]["label"], tiers[0]["base_sim"]
     )
-    assert fingerprints._match_ord_gate(reactants, products, delta, [], delta) == ("RDKit ΔFG match", 0.58)
+    assert fingerprints._match_ord_gate(reactants, products, delta, [], delta) == (
+        "RDKit ΔFG semantic match: alcohol oxidation", 0.62
+    )
 
     competing = "CC(=O)Cl.CCO>>CC=O"
     reactants, products = fingerprints._parse_reaction_mols(competing)
@@ -144,10 +166,11 @@ def test_relaxed_mcs_and_achiral_fallback_match_substituted_and_flat_analogs():
     assert gate[0].startswith("Tier 2: MCS Reaction Center")
 
 
-def test_core_extractor_uses_largest_reactant_and_reduced_product_scaffold():
+def test_core_extractor_reduces_reaction_center_queries():
     rxn = "CCOC(=O)c1ccc(Br)cc1.B(O)c1ccccc1>>CCOC(=O)c1ccc(-c2ccccc2)cc1"
     cores = fingerprints._rdkit_extract_reacting_cores(rxn)
-    assert cores["core_reactant"] == "CCOC(=O)c1ccc(Br)cc1"
+    reactant = Chem.MolFromSmiles(cores["core_reactant"])
+    assert reactant.GetNumHeavyAtoms() <= 10
     product = Chem.MolFromSmiles(cores["core_product"])
     scaffold = Chem.MolFromSmiles(cores["core_product_scaffold"])
     assert scaffold.GetNumHeavyAtoms() >= 4
@@ -343,6 +366,24 @@ def test_unvalidated_confidence_is_lower_than_documented_negative_data(tmp_path)
     assert _scale_route_eln(route, "CC=O", 1.0, yield_override=0.5)
 
 
+def test_unvalidated_scenario_yield_renders_a_scaled_eln(tmp_path):
+    validator = ord_validator.ORDRetrosynthesisValidator(tmp_path / "eln.duckdb")
+    forward = "CC(=O)O.NCC>>CC(=O)NCC"
+    step = classifier.rdkit_classify_step(forward, ord_validator=validator)
+    step.update(step_index=1, precursor_steps=[])
+    route = {"steps": [step]}
+
+    plans = workbench._scale_route_eln(route, "CC(=O)NCC", 1.0)
+    text = workbench._eln_step_text(plans[0], markdown=True)
+    html = workbench._render_eln_step_html(plans[0])
+
+    assert plans[0]["yield_basis"] == "scenario"
+    assert "50% unvalidated scenario yield" in text
+    assert "Unvalidated" in text
+    assert "scenario yield" in html
+    assert "HATU" in text
+
+
 def test_online_ord_failures_are_retried_only_after_incomplete_calls(tmp_path, monkeypatch):
     validator = ord_validator.ORDRetrosynthesisValidator(tmp_path / "retry.duckdb")
     monkeypatch.setattr(
@@ -374,6 +415,35 @@ def test_online_ord_failures_are_retried_only_after_incomplete_calls(tmp_path, m
         [OXIDATION], max_workers=1, wall_timeout_sec=2.0
     )
     assert calls == 2
+
+
+def test_online_ord_parses_on_coordinator_thread_and_refreshes_validation(tmp_path, monkeypatch):
+    validator = ord_validator.ORDRetrosynthesisValidator(tmp_path / "online.duckdb")
+    reaction = reaction_pb2.Reaction(reaction_id="ord-online-amide")
+    for smi in ("CC(=O)O", "NCC"):
+        compound = reaction.inputs["starting material"].components.add(reaction_role="REACTANT")
+        compound.identifiers.add(type=reaction_pb2.CompoundIdentifier.SMILES, value=smi)
+    product = reaction.outcomes.add().products.add(is_desired_product=True)
+    product.identifiers.add(type=reaction_pb2.CompoundIdentifier.SMILES, value="CC(=O)NCC")
+    product.measurements.add(type=reaction_pb2.ProductMeasurement.YIELD).percentage.value = 81
+    monkeypatch.setattr(
+        ord_validator, "_fetch_step_ord_records_worker",
+        lambda *args, **kwargs: [reaction.SerializeToString()],
+    )
+    monkeypatch.setattr(validator, "_auto_sync_hf_ord_if_sparse", lambda *args, **kwargs: 0)
+    revision = validator.index_revision
+
+    stats = validator.batch_prefetch_online_ord(
+        ["CC(=O)O.NCC>>CC(=O)NCC"], max_workers=1, wall_timeout_sec=2.0
+    )
+    report = validator.validate_step("CC(=O)O.NCC>>CC(=O)NCC")
+
+    assert stats["added_records"] == 1
+    assert stats["parse_drops"] == 0
+    assert stats["indexed_count"] == 1
+    assert validator.index_revision == revision + 1
+    assert report["smarts_matched_count"] == 1
+    assert report["top_precedents"][0]["ord_id"] == "ord-online-amide"
 
 
 def test_online_ord_uses_largest_reactant_and_scaffold_fallback(monkeypatch):
@@ -435,6 +505,41 @@ def test_gemini_cache_is_scoped_to_the_ord_validator(tmp_path, monkeypatch):
     switched = classifier.batch_classify_with_gemini([OXIDATION], state=state, ord_validator=second)
     assert switched[OXIDATION]["gemini_tag"] != initial[OXIDATION]["gemini_tag"]
     assert len(calls) == 2
+
+
+def test_gemini_preserves_unvalidated_classification_without_fake_evidence(tmp_path, monkeypatch):
+    validator = ord_validator.ORDRetrosynthesisValidator(tmp_path / "gemini.duckdb")
+    forward = "O=C(O)C.NCC>>CC(=O)NCC"
+    baseline = classifier.rdkit_classify_step(forward, ord_validator=validator)
+    proposed = json.loads(json.dumps(baseline))
+    proposed["reaction_name"] = "Amide bond formation"
+    proposed["experimental_procedure"] = "Invented 95% empirical procedure"
+    proposed["source_doi_or_patent"] = "10.fake/claimed"
+    proposed["assumed_step_yield"] = 0.95
+    for condition in proposed["ranked_conditions"]:
+        condition["citation_or_ord_id"] = "10.fake/claimed"
+        condition["expected_yield_range"] = "95% reported"
+    response = SimpleNamespace(text=json.dumps({"steps": [proposed]}))
+    monkeypatch.setattr(classifier, "get_gemini_client", object)
+    monkeypatch.setattr(classifier, "fetch_verified_literature_dois", lambda *args: [])
+    monkeypatch.setattr(
+        classifier, "call_gemini_with_config",
+        lambda **kwargs: (response, "test-model", "medium"),
+    )
+
+    result = classifier.batch_classify_with_gemini(
+        [forward], state=WorkbenchState(), ord_validator=validator
+    )[forward]
+
+    assert result["gemini_enriched"]
+    assert result["reaction_name"] == "Amide bond formation"
+    assert result["assumed_step_yield"] is None
+    assert result["experimental_procedure"] == ""
+    assert result["source_doi_or_patent"] == ""
+    assert all(row["citation_or_ord_id"] == "USPTO/ΔFG Standard"
+               for row in result["ranked_conditions"])
+    assert all("reported" not in row["expected_yield_range"].lower()
+               for row in result["ranked_conditions"])
 
 
 def test_pipeline_applies_templates_and_lab_stock_without_leaking_canvas_locks(tmp_path, monkeypatch):

@@ -265,6 +265,67 @@ def compute_spectator_functional_groups(rxn_smiles):
     }
 
 
+def classify_reaction_family(
+    rxn_smiles: str,
+    delta=None,
+    include_structure: bool = True,
+) -> str:
+    """Return a broad medicinal-chemistry family for reaction-center matching."""
+    reactants, products = _parse_reaction_mols(rxn_smiles)
+    if not reactants or not products:
+        return ""
+    consumed, formed, _ = delta or compute_rdkit_internal_delta_fg(rxn_smiles)
+    consumed, formed = set(consumed), set(formed)
+    has_amide = bool(
+        {"fr_amide", "SMARTSRX_Amide"} & formed
+    )
+    has_acid = bool(
+        {"fr_COO", "RDKitFG_CarboxylicAcid", "RDKitFG_CarboxylicAcid.Aromatic",
+         "RDKitFG_CarboxylicAcid.Aliphatic", "RDKitFG_AcidChloride",
+         "RDKitFG_AcidChloride.Aromatic", "RDKitFG_AcidChloride.Aliphatic",
+         "fr_acyl_halide"} & consumed
+    )
+    has_amine = any("Amine" in name for name in consumed)
+    has_alcohol = any("Alcohol" in name for name in consumed)
+    has_ester = bool({"fr_ester", "SMARTSRX_EsterAcyclic"} & (consumed | formed))
+    forms_acid = bool({"fr_COO", "RDKitFG_CarboxylicAcid"} & formed)
+    if has_acid and has_amine and has_amide:
+        return "amide_coupling"
+    if has_acid and has_alcohol and "fr_ester" in formed:
+        return "esterification"
+    if "fr_ester" in consumed and forms_acid:
+        return "saponification"
+    halogen_lost = bool(
+        {"fr_halogen", "RDKitFG_Halogen", "RDKitFG_Halogen.Aromatic"} & consumed
+    )
+    reactant_elements = {
+        atom.GetAtomicNum()
+        for mol in reactants
+        for atom in mol.GetAtoms()
+    }
+    product_has_aryl_carbon = any(
+        atom.GetIsAromatic() and atom.GetAtomicNum() == 6
+        for mol in products
+        for atom in mol.GetAtoms()
+    )
+    if include_structure and 5 in reactant_elements and halogen_lost and product_has_aryl_carbon:
+        return "suzuki"
+    aromatic_halogen_lost = bool(
+        {"RDKitFG_Halogen.Aromatic", "RDKitFG_Halogen.NotFluorine.Aromatic"} & consumed
+    )
+    if aromatic_halogen_lost and has_amine:
+        return "aryl_amination"
+    if has_alcohol and bool({"fr_aldehyde", "RDKitFG_Aldehyde", "fr_ketone", "RDKitFG_Ketone"} & formed):
+        return "alcohol_oxidation"
+    if bool({"fr_aldehyde", "RDKitFG_Aldehyde", "fr_ketone", "RDKitFG_Ketone"} & consumed) and bool(
+        {"RDKitFG_Alcohol"} & formed
+    ):
+        return "carbonyl_reduction"
+    if has_ester and not has_acid:
+        return "ester_formation_or_cleavage"
+    return ""
+
+
 @functools.lru_cache(maxsize=128)
 def _compile_rxn_smarts_queries(rxn_smarts: str):
     """
@@ -511,7 +572,7 @@ def _reverse_reaction(reaction):
 
 
 def build_progressive_reaction_smarts(forward_smiles: str, template_smarts: Optional[str] = None, mapped_forward_smiles: Optional[str] = None) -> List[dict]:
-    """Exact USPTO template, followed by local MCS centers at radii 1 and 0."""
+    """Exact USPTO template, local MCS centers, then broad medicinal-chemistry SMARTS."""
     s = (forward_smiles or "").strip()
     candidates = [(1, "Tier 1: Exact USPTO Template SMARTS", 0.82, _reverse_reaction(template_smarts or ""))]
     try:
@@ -520,6 +581,32 @@ def build_progressive_reaction_smarts(forward_smiles: str, template_smarts: Opti
             candidates.append((tier, f"Tier {tier}: MCS Reaction Center (radius {radius})", (0.68, 0.58)[tier - 2], smarts))
     except (ValueError, RuntimeError):
         pass  # No trustworthy MCS; the exact template and ΔFG gate remain available.
+    semantic_smarts = {
+        "amide_coupling": (
+            "Amide coupling",
+            "[#6X3](=[#8X1])[#8X2H1].[#7X3;H1,H2]>>[#6X3](=[#8X1])[#7X3]",
+        ),
+        "esterification": (
+            "Esterification",
+            "[#6X3](=[#8X1])[#8X2H1].[#8X2H1]>>[#6X3](=[#8X1])[#8X2][#6]",
+        ),
+        "saponification": (
+            "Saponification",
+            "[#6X3](=[#8X1])[#8X2][#6]>>[#6X3](=[#8X1])[#8X2H1].[#8X2H1]",
+        ),
+        "aryl_amination": (
+            "Aryl amination / Buchwald-Hartwig / SNAr",
+            "[c][F,Cl,Br,I].[#7X3;H1,H2]>>[c][#7X3]",
+        ),
+        "suzuki": (
+            "Suzuki-Miyaura coupling",
+            "[c][BX3]([#8])([#8]).[c][F,Cl,Br,I]>>[c]-[c]",
+        ),
+    }
+    family = classify_reaction_family(s)
+    if family in semantic_smarts:
+        label, smarts = semantic_smarts[family]
+        candidates.append((len(candidates) + 1, f"Tier {len(candidates) + 1}: {label} semantic SMARTS", 0.64, smarts))
     return [{"tier": tier, "label": label, "smarts": smarts, "queries": queries, "base_sim": base}
             for tier, label, base, smarts in candidates if smarts and (queries := _compile_rxn_smarts_queries(smarts))]
 
@@ -540,6 +627,30 @@ def _match_ord_gate(reactants, products, delta, tiers, query_delta):
         if matches_reaction_smarts_mols(reactants, products, tier["queries"], use_chirality=False):
             return f"{tier['label']} (achiral)", max(0.0, tier["base_sim"] - 0.02)
 
+    query_family = ""
+    candidate_family = ""
+    if reactants and products:
+        candidate_family = classify_reaction_family(
+            ">>".join((
+                ".".join(Chem.MolToSmiles(mol) for mol in reactants),
+                ".".join(Chem.MolToSmiles(mol) for mol in products),
+            )),
+            delta,
+        )
+        if query_delta and any((Counter(groups) for groups in query_delta[:2])):
+            query_family = classify_reaction_family(
+                ">>".join((
+                    ".".join(Chem.MolToSmiles(mol) for mol in reactants),
+                    ".".join(Chem.MolToSmiles(mol) for mol in products),
+                )),
+                query_delta,
+                include_structure=False,
+            )
+    # Semantic family membership is an independent ΔFG gate: aromatic/aliphatic
+    # labels and unrelated spectator groups must not hide a common transformation.
+    if query_family and candidate_family == query_family:
+        return f"RDKit ΔFG semantic match: {query_family.replace('_', ' ')}", 0.62
+
     def jaccard(a, b):
         a, b = Counter(a), Counter(b)
         keys = set(a) | set(b)
@@ -553,8 +664,7 @@ def _match_ord_gate(reactants, products, delta, tiers, query_delta):
 
 def _rdkit_extract_reacting_cores(forward_smiles: str) -> dict:
     """
-    Sub-millisecond RDKit reaction-center extractor for Tier-2 online ORD fallback queries.
-    Selects the largest heavy-atom limiting reactant and primary product.
+    Extract compact reaction-center SMILES for online ORD similarity queries.
     """
     s = (forward_smiles or "").strip()
     react_s, prod_s = s.split(">>", 1) if ">>" in s else (s, "")
@@ -564,20 +674,18 @@ def _rdkit_extract_reacting_cores(forward_smiles: str) -> dict:
         return {"core_reactant": "", "core_product": "", "core_product_scaffold": ""}
 
     r_mols = [(smi, Chem.MolFromSmiles(smi)) for smi in r_smiles]
-    r_mols = [(smi, m) for smi, m in r_mols if m is not None]
-    r_mols.sort(key=lambda x: x[1].GetNumHeavyAtoms(), reverse=True)
-    lim_r_smi = r_mols[0][0] if r_mols else r_smiles[0]
+    r_mols = [(smi, mol) for smi, mol in r_mols if mol is not None]
     product = Chem.MolFromSmiles(p_smi)
     if product is None:
-        return {"core_reactant": lim_r_smi, "core_product": p_smi, "core_product_scaffold": p_smi}
+        fallback = r_smiles[0] if r_smiles else ""
+        return {"core_reactant": fallback, "core_product": p_smi, "core_product_scaffold": p_smi}
 
     canonical_product = Chem.MolToSmiles(product, canonical=True, isomericSmiles=True)
-    centers = set()
+    centers, reactant_centers = set(), defaultdict(set)
     reactants = [mol for _, mol in r_mols]
     if reactants:
         try:
             mapping = _mcs_atom_correspondence(reactants, product)
-            inverse = set(mapping.values())
             for (reactant_idx, atom_idx), product_idx in mapping.items():
                 if _atom_changed(
                     reactants[reactant_idx],
@@ -586,46 +694,83 @@ def _rdkit_extract_reacting_cores(forward_smiles: str) -> dict:
                     product_idx,
                     lambda idx: mapping.get((reactant_idx, idx)),
                 ):
+                    reactant_centers[reactant_idx].add(atom_idx)
                     centers.add(product_idx)
-                    centers.update(
-                        neighbor.GetIdx()
-                        for neighbor in product.GetAtomWithIdx(product_idx).GetNeighbors()
-                        if neighbor.GetIdx() not in inverse
-                    )
         except (ValueError, RuntimeError):
             centers = set()
 
-    scaffold = ""
-    for radius in (3, 2):
-        atoms = set(centers)
-        for _ in range(radius):
-            atoms.update(
-                neighbor.GetIdx()
-                for atom_idx in tuple(atoms)
-                for neighbor in product.GetAtomWithIdx(atom_idx).GetNeighbors()
-            )
-        if sum(product.GetAtomWithIdx(idx).GetAtomicNum() > 1 for idx in atoms) < 4:
-            continue
-        try:
-            fragment = Chem.MolFragmentToSmiles(
-                product, sorted(atoms), isomericSmiles=True, canonical=True
-            )
-            fragment_mol = Chem.MolFromSmiles(fragment)
-            if fragment_mol is not None:
-                scaffold = Chem.MolToSmiles(fragment_mol, canonical=True, isomericSmiles=True)
-                if scaffold != canonical_product:
-                    break
-        except (ValueError, RuntimeError):
-            scaffold = ""
-    if not scaffold or scaffold == canonical_product and centers:
+    def compact_fragment(mol, center, max_heavy=16):
+        if not center:
+            return ""
+        for radius in (1, 0):
+            atoms = set(center)
+            for _ in range(radius):
+                atoms.update(
+                    neighbor.GetIdx()
+                    for atom_idx in tuple(atoms)
+                    for neighbor in mol.GetAtomWithIdx(atom_idx).GetNeighbors()
+                )
+            heavy = sum(mol.GetAtomWithIdx(idx).GetAtomicNum() > 1 for idx in atoms)
+            if heavy < 3 or heavy > max_heavy:
+                continue
+            try:
+                fragment = Chem.MolFragmentToSmiles(
+                    mol, sorted(atoms), isomericSmiles=True, canonical=True
+                )
+                parsed = Chem.MolFromSmiles(fragment)
+                if parsed is not None:
+                    return Chem.MolToSmiles(parsed, canonical=True, isomericSmiles=True)
+            except (ValueError, RuntimeError):
+                pass
+        return ""
+
+    if not centers:
+        family = classify_reaction_family(s)
+        product_patterns = {
+            "amide_coupling": "[#6X3](=[#8X1])[#7X3]",
+            "esterification": "[#6X3](=[#8X1])[#8X2][#6]",
+            "saponification": "[#6X3](=[#8X1])[#8X2H1]",
+            "aryl_amination": "[c][#7X3]",
+            "suzuki": "[c]-[c]",
+        }
+        pattern = Chem.MolFromSmarts(product_patterns.get(family, ""))
+        if pattern is not None:
+            match = next(iter(product.GetSubstructMatches(pattern)), ())
+            centers.update(match)
+
+    scaffold = compact_fragment(product, centers)
+    if not scaffold:
         try:
             murcko = MurckoScaffold.GetScaffoldForMol(product)
-            if murcko is not None and murcko.GetNumHeavyAtoms() >= 4:
+            if murcko is not None and murcko.GetNumHeavyAtoms() <= 16:
                 scaffold = Chem.MolToSmiles(murcko, canonical=True, isomericSmiles=True)
         except (ValueError, RuntimeError):
             scaffold = ""
+
+    core_reactant = ""
+    reactant_core_candidates = []
+    for idx, atoms in reactant_centers.items():
+        fragment = compact_fragment(r_mols[idx][1], atoms)
+        if fragment:
+            reactant_core_candidates.append(fragment)
+    if reactant_core_candidates:
+        core_reactant = min(
+            reactant_core_candidates,
+            key=lambda smi: (
+                Chem.MolFromSmiles(smi).GetNumHeavyAtoms(),
+                smi,
+            ),
+        )
+    else:
+        r_mols.sort(key=lambda item: item[1].GetNumHeavyAtoms())
+        for _, mol in r_mols:
+            if mol.GetNumHeavyAtoms() <= 16:
+                core_reactant = Chem.MolToSmiles(
+                    mol, canonical=True, isomericSmiles=True
+                )
+                break
     return {
-        "core_reactant": lim_r_smi,
+        "core_reactant": core_reactant,
         "core_product": canonical_product,
         "core_product_scaffold": scaffold or canonical_product,
     }

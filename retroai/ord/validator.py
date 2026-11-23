@@ -42,7 +42,7 @@ from .fingerprints import (
 from .parser import _humanize_condition_list, parse_ord_reaction_protobuf
 
 
-ORD_DB_PATH = "/dev/shm/ord_precedents.duckdb" if os.path.isdir("/dev/shm") else "data/ord_precedents.duckdb"
+ORD_DB_PATH = os.environ.get("RETROAI_ORD_DB_PATH", "data/ord_precedents.duckdb")
 ORD_ONLINE_API_BASE = "https://open-reaction-database.org/api"
 
 
@@ -104,7 +104,11 @@ def _submit_and_poll_ord_session(
             raise RuntimeError(f"ORD query submission returned HTTP {sub_resp.status_code}")
         try:
             payload = sub_resp.json()
-            task_id = payload.get("task_id", payload) if isinstance(payload, dict) else str(payload)
+            task_id = (
+                payload.get("task_id") or payload.get("id")
+                if isinstance(payload, dict)
+                else str(payload)
+            )
         except Exception:
             task_id = sub_resp.text.strip().strip('"')
         if not task_id:
@@ -119,16 +123,31 @@ def _submit_and_poll_ord_session(
             )
             if poll_resp.status_code == 200:
                 items = poll_resp.json()
+                if isinstance(items, dict):
+                    items = (
+                        items.get("results")
+                        or items.get("reactions")
+                        or items.get("items")
+                        or items.get("records")
+                        or []
+                    )
                 if not isinstance(items, list):
                     raise RuntimeError("ORD query result was not a list")
                 out_protos = []
                 for item in items:
-                    b64_proto = item.get("proto") if isinstance(item, dict) else None
+                    b64_proto = None
+                    if isinstance(item, dict):
+                        b64_proto = next((
+                            item[key] for key in ("proto", "protobuf", "reaction", "serialized")
+                            if item.get(key)
+                        ), None)
+                    elif isinstance(item, str):
+                        b64_proto = item
                     if b64_proto:
                         try:
-                            out_protos.append(base64.b64decode(b64_proto))
-                        except Exception:
-                            continue
+                            out_protos.append(base64.b64decode(b64_proto, validate=True))
+                        except Exception as exc:
+                            logging.warning("Dropping malformed base64 ORD result: %s", type(exc).__name__)
                 return out_protos
             elif poll_resp.status_code in (202, 404):
                 time.sleep(poll_interval)
@@ -157,7 +176,7 @@ def _fetch_step_ord_records_worker(
         return []
 
     react_s, prod_s = [p.strip() for p in s.split(">>", 1)]
-    r_list = [x.strip() for x in react_s.split(".") if x.strip()][:2]
+    r_list = [x.strip() for x in react_s.split(".") if x.strip()]
     p_smi = _extract_primary_smiles(prod_s)
     if not p_smi:
         return []
@@ -165,8 +184,9 @@ def _fetch_step_ord_records_worker(
         core_reactant = _rdkit_extract_reacting_cores(s)["core_reactant"]
 
     t0 = time.time()
+    output_core = core_product or p_smi
     tier1_params = [
-        ("component", f"{p_smi};output;similarity"),
+        ("component", f"{output_core};output;similarity"),
         ("similarity", str(similarity_threshold)),
         ("use_stereochemistry", "false"),
         ("limit", str(limit)),
@@ -184,7 +204,7 @@ def _fetch_step_ord_records_worker(
     if not raw_protos and core_product and elapsed < (per_step_timeout - 1.0):
         fallback_threshold = max(0.30, similarity_threshold - 0.10)
         tier2_params = [
-            ("component", f"{core_product};output;similarity"),
+            ("component", f"{core_product or output_core};output;similarity"),
             ("similarity", f"{fallback_threshold:.2f}"),
             ("use_stereochemistry", "false"),
             ("limit", str(limit)),
@@ -196,6 +216,80 @@ def _fetch_step_ord_records_worker(
         )
 
     return raw_protos
+
+
+def _parse_parquet_ord_row(row: dict, admit=None) -> Optional[dict]:
+    for key in ("proto", "protobuf", "reaction_proto", "serialized", "reaction"):
+        payload = row.get(key)
+        if isinstance(payload, (bytes, bytearray, memoryview)):
+            try:
+                reaction = ord_reaction_pb2.Reaction()
+                reaction.ParseFromString(bytes(payload))
+                return parse_ord_reaction_protobuf(reaction, admit=admit)
+            except Exception:
+                return None
+    raw_rxn = str(
+        row.get("rxn_smiles")
+        or row.get("reaction_smiles")
+        or row.get("reaction")
+        or ""
+    ).strip()
+    if raw_rxn.count(">") >= 1 and ">>" not in raw_rxn:
+        parts = raw_rxn.split(">")
+        raw_rxn = f"{parts[0]}>>{parts[-1]}"
+    reactants, products = _parse_reaction_mols(raw_rxn)
+    if not reactants or not products or (admit is not None and not admit(raw_rxn)):
+        return None
+    reaction_id = str(row.get("reaction_id") or row.get("ord_id") or "").strip()
+    if not reaction_id:
+        return None
+    product = products[0]
+    product_inchikey = Chem.MolToInchiKey(product)
+    fp_bytes = compute_folded_rxn_fp(raw_rxn)
+    if fp_bytes is None:
+        return None
+    diff_fp = compute_rxn_center_diff_fp(raw_rxn)
+    consumed, formed, _ = compute_rdkit_internal_delta_fg(raw_rxn)
+    try:
+        yield_pct = float(row.get("yield_pct"))
+    except (TypeError, ValueError):
+        yield_pct = None
+    condition = lambda key, fallback: str(row.get(key) or fallback)
+    return {
+        "ord_id": reaction_id,
+        "rxn_smiles": raw_rxn,
+        "prod_inchikey": product_inchikey,
+        "prod_connectivity": product_inchikey.split("-")[0],
+        "yield_pct": yield_pct,
+        "catalysts": condition("catalysts", "None"),
+        "reagents": condition("reagents", "None"),
+        "solvents": condition("solvents", "Unspecified"),
+        "temp_c": float(row["temp_c"]) if row.get("temp_c") is not None else None,
+        "atmosphere": condition("atmosphere", "UNSPECIFIED"),
+        "undesired_byproducts": condition("undesired_byproducts", "None"),
+        "reference": condition("reference", f"ORD ({reaction_id})"),
+        "fp_bytes": fp_bytes,
+        "drfp_bytes": compute_drfp_bytes(raw_rxn),
+        "diff_fp_bytes": diff_fp.ToBinary() if diff_fp is not None else None,
+        "consumed_fgs": json.dumps(sorted(consumed.elements())),
+        "formed_fgs": json.dumps(sorted(formed.elements())),
+        "procedure_details": condition("procedure_details", ""),
+        "doi": condition("doi", ""),
+        "patent_id": condition("patent_id", ""),
+        "condition_stoichiometry": condition("condition_stoichiometry", "[]"),
+        "duration_h": row.get("duration_h"),
+    }
+
+
+def _iter_hf_ord_parquet(path: str, limit: int):
+    with duckdb.connect() as con:
+        description = con.execute(
+            "SELECT * FROM read_parquet(?) LIMIT ?",
+            [str(path), int(limit)],
+        )
+        columns = [column[0] for column in description.description]
+        for values in description.fetchall():
+            yield dict(zip(columns, values))
 
 
 class ORDRetrosynthesisValidator:
@@ -336,12 +430,31 @@ class ORDRetrosynthesisValidator:
         )
         self.index_revision += 1
         self._validate_cached.cache_clear()
+        self._index_db_token = self._database_token()
 
     def get_index_size(self) -> int:
         return self._index_size
 
     def get_cbyd_index_size(self) -> int:
         return self._cbyd_index_size
+
+    def _database_token(self) -> tuple:
+        values = []
+        for path in (self.db_path, f"{self.db_path}.wal"):
+            try:
+                stat = os.stat(path)
+                values.append((stat.st_size, stat.st_mtime_ns))
+            except OSError:
+                values.append((0, 0))
+        return tuple(values)
+
+    def _ensure_index_current(self) -> None:
+        if self._database_token() != getattr(self, "_index_db_token", ()):
+            self.refresh_index()
+
+    def refresh_index(self) -> None:
+        """Rebuild ORD/CbyD in-memory indexes after any shared DuckDB writer."""
+        self._refresh_index()
 
     def _query_cbyd_precedents(
         self,
@@ -534,7 +647,16 @@ class ORDRetrosynthesisValidator:
         """
         specs = _ord_gate_specs(forward_smiles_list, route_steps)
         if not specs:
-            return {"queried_steps": 0, "added_records": 0, "elapsed_sec": 0.0, "indexed_count": self.get_index_size()}
+            return {
+                "queried_steps": 0,
+                "added_records": 0,
+                "online_added": 0,
+                "parse_drops": 0,
+                "api_failures": 0,
+                "elapsed_sec": 0.0,
+                "indexed_count": self.get_index_size(),
+                "cbyd_indexed_count": self.get_cbyd_index_size(),
+            }
 
         t_start = time.time()
         steps_to_fetch = set()
@@ -550,11 +672,16 @@ class ORDRetrosynthesisValidator:
             return {
                 "queried_steps": 0,
                 "added_records": hf_added,
+                "online_added": 0,
+                "parse_drops": 0,
+                "api_failures": 0,
                 "elapsed_sec": round(time.time() - t_start, 3),
                 "indexed_count": self.get_index_size(),
+                "cbyd_indexed_count": self.get_cbyd_index_size(),
             }
 
         raw_proto_batches = []
+        api_failures = 0
         n_workers = min(max_workers, len(steps_to_fetch))
         per_step_budget = min(6.0, max(2.0, wall_timeout_sec - 0.5))
         cores = {smi: _rdkit_extract_reacting_cores(smi) for smi in steps_to_fetch}
@@ -581,15 +708,18 @@ class ORDRetrosynthesisValidator:
                         raw_proto_batches.extend(pb_list)
                     self._online_queried_steps.add(future_to_smi[fut])
                 except Exception as exc:
+                    api_failures += 1
                     logging.warning("Online ORD lookup for %r failed: %s", future_to_smi[fut], exc)
                     continue
-        except Exception:
-            pass
+        except Exception as exc:
+            api_failures += 1
+            logging.warning("Online ORD batch did not complete before timeout: %s", exc)
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
 
         # Parse Protobufs and run RDKit on the main thread ONLY (thread-safe)
         all_new_records = {}
+        parse_drops = 0
         for pb_bytes in raw_proto_batches:
             try:
                 rxn_pb = ord_reaction_pb2.Reaction()
@@ -597,26 +727,49 @@ class ORDRetrosynthesisValidator:
                 rec = parse_ord_reaction_protobuf(rxn_pb)
                 if rec and rec.get("ord_id") and rec["ord_id"] not in all_new_records:
                     all_new_records[rec["ord_id"]] = rec
-            except Exception:
+                elif not rec:
+                    parse_drops += 1
+            except Exception as exc:
+                parse_drops += 1
+                logging.warning(
+                    "Dropping ORD protobuf after coordinator-thread parse failure: %s",
+                    type(exc).__name__,
+                )
                 continue
 
-        added_cnt = 0
+        online_added = 0
         if all_new_records:
-            con = duckdb.connect(self.db_path)
-            df_bulk = pd.DataFrame(list(all_new_records.values()))
-            con.execute("INSERT OR REPLACE INTO ord_reactions BY NAME SELECT * FROM df_bulk")
-            con.close()
+            with duckdb.connect(self.db_path) as con:
+                identifiers = list(all_new_records)
+                placeholders = ",".join("?" for _ in identifiers)
+                existing = {
+                    row[0] for row in con.execute(
+                        f"SELECT ord_id FROM ord_reactions WHERE ord_id IN ({placeholders})",
+                        identifiers,
+                    ).fetchall()
+                }
+                df_bulk = pd.DataFrame(list(all_new_records.values()))
+                con.execute("INSERT OR REPLACE INTO ord_reactions BY NAME SELECT * FROM df_bulk")
+            online_added = len(set(identifiers) - existing)
             self._refresh_index()
-            added_cnt = len(all_new_records)
 
         # Auto-index real ORD reactions from Hugging Face when the local DuckDB index is empty/sparse
-        added_cnt += self._auto_sync_hf_ord_if_sparse(forward_smiles_list, route_steps)
+        hf_added = self._auto_sync_hf_ord_if_sparse(forward_smiles_list, route_steps)
+        if parse_drops or api_failures:
+            logging.warning(
+                "ORD prefetch diagnostics: %d API failures, %d parse drops, %d inserted online records",
+                api_failures, parse_drops, online_added,
+            )
 
         return {
             "queried_steps": len(steps_to_fetch),
-            "added_records": added_cnt,
+            "added_records": online_added + hf_added,
+            "online_added": online_added,
+            "parse_drops": parse_drops,
+            "api_failures": api_failures,
             "elapsed_sec": round(time.time() - t_start, 2),
             "indexed_count": self.get_index_size(),
+            "cbyd_indexed_count": self.get_cbyd_index_size(),
         }
 
     def _auto_sync_hf_ord_if_sparse(self, forward_smiles_list: List[str], route_steps=None) -> int:
@@ -667,14 +820,10 @@ class ORDRetrosynthesisValidator:
             all_files = list_repo_files(repo_id=repo_id, repo_type="dataset", token=token)
             parquet_files = [f for f in all_files if f.endswith(".parquet")]
             protobuf_files = [f for f in all_files if f.endswith((".pb.gz", ".pb"))]
-            if parquet_files:
-                logging.warning(
-                    "Skipping %d unsupported ORD Parquet shard(s); only protobuf .pb/.pb.gz shards are loaded",
-                    len(parquet_files),
-                )
             # Prioritize diverse benchmark datasets (including ord_dataset-00005539a1e04c809a9a78647bea649c) first
-            priority = [f for f in protobuf_files if "00005539a1e04c809a9a78647bea649c" in f]
-            others = [f for f in protobuf_files if f not in priority]
+            supported = protobuf_files + parquet_files
+            priority = [f for f in supported if "00005539a1e04c809a9a78647bea649c" in f]
+            others = [f for f in supported if f not in priority]
             ordered_files = priority + others
             target_shards = [f for f in ordered_files if f not in scanned][:max(1, int(max_shards))]
         except Exception as e:
@@ -685,15 +834,22 @@ class ORDRetrosynthesisValidator:
         for shard in target_shards:
             try:
                 local_path = hf_hub_download(repo_id=repo_id, filename=shard, repo_type="dataset", token=token)
-                dataset = ord_datasets.load_dataset(local_path)
                 records = {}
-                rxn_iter = getattr(dataset, "reactions", None)
-                if rxn_iter is None and hasattr(dataset, "iter_reactions"):
-                    rxn_iter = (r for _, r in dataset.iter_reactions())
+                if shard.endswith(".parquet"):
+                    rxn_iter = _iter_hf_ord_parquet(local_path, max_reactions_per_shard)
+                else:
+                    dataset = ord_datasets.load_dataset(local_path)
+                    rxn_iter = getattr(dataset, "reactions", None)
+                    if rxn_iter is None and hasattr(dataset, "iter_reactions"):
+                        rxn_iter = (r for _, r in dataset.iter_reactions())
                 for idx, rxn in enumerate(rxn_iter or []):
                     if idx >= max_reactions_per_shard:
                         break
-                    parsed = parse_ord_reaction_protobuf(rxn, admit=admit)
+                    parsed = (
+                        _parse_parquet_ord_row(rxn, admit=admit)
+                        if shard.endswith(".parquet")
+                        else parse_ord_reaction_protobuf(rxn, admit=admit)
+                    )
                     if parsed:
                         records[parsed["ord_id"]] = parsed
                 if records:
@@ -715,6 +871,7 @@ class ORDRetrosynthesisValidator:
         }
 
     def validate_step(self, forward_smiles: str, top_k: int = 3, *, template_info=None) -> dict:
+        self._ensure_index_current()
         s = (forward_smiles or "").strip()
         info = template_info or {}
         return self._validate_cached(s, top_k, info.get("retro_template", ""), info.get("mapped_forward_smiles", ""))
@@ -830,8 +987,7 @@ class ORDRetrosynthesisValidator:
                 rec["precedent_id"] = rec["ord_id"]
                 analog_records.append(rec)
 
-            current_max = max((r["similarity"] for r in analog_records), default=0.0)
-            if current_max < 0.55 and self._cbyd_index_size:
+            if self._cbyd_index_size:
                 cbyd_records, cbyd_exact_hits = self._query_cbyd_precedents(
                     s, prod_conn, tiers, delta, query_drfp, q_bits, top_k=50
                 )

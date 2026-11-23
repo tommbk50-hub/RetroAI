@@ -14,6 +14,7 @@ from retroai.engine.aizynth import (
     _flatten_reaction_tree,
     is_common_lab_reagent,
 )
+from retroai.ord import validator as ord_validator
 from retroai.ord.validator import ORDRetrosynthesisValidator
 
 
@@ -150,6 +151,46 @@ def test_stereoselective_yield_fields_and_chemoselective_reranking(tmp_path):
     assert hits[0]["ee"] == "96% ee"
 
 
+def test_validator_merges_strong_ord_and_cbyd_analog_sets(tmp_path, monkeypatch):
+    reaction = "CCO>>CC=O"
+    db_path = tmp_path / "dual.duckdb"
+    validator = ORDRetrosynthesisValidator(db_path)
+    ord_record = {
+        "ord_id": "ord-strong",
+        "rxn_smiles": reaction,
+        "prod_inchikey": Chem.MolToInchiKey(Chem.MolFromSmiles("CC=O")),
+        "prod_connectivity": Chem.MolToInchiKey(Chem.MolFromSmiles("CC=O")).split("-")[0],
+        "yield_pct": 90.0,
+        "catalysts": "None",
+        "reagents": "DMP",
+        "solvents": "DCM",
+        "temp_c": 20.0,
+        "atmosphere": "NITROGEN",
+        "undesired_byproducts": "None",
+        "reference": "ORD",
+        "fp_bytes": ord_validator.compute_folded_rxn_fp(reaction),
+    }
+    with duckdb.connect(str(db_path)) as con:
+        columns = ",".join(ord_record)
+        con.execute(
+            f"INSERT INTO ord_reactions ({columns}) VALUES ({','.join('?' for _ in ord_record)})",
+            list(ord_record.values()),
+        )
+    validator._refresh_index()
+    routes = tmp_path / "routes"
+    routes.mkdir()
+    (routes / "cbyd.json").write_text(
+        json.dumps(_route("cbyd-dual", reaction, reagents=["TEMPO"])),
+        encoding="utf-8",
+    )
+    ingest_cbyd_routes(routes, db_path, release_version="v2026.11")
+
+    report = validator.validate_step(reaction)
+
+    assert report["smarts_matched_count"] == 2
+    assert {hit["provider"] for hit in report["top_precedents"]} == {"ORD", "CbyD"}
+
+
 def test_complexity_key_steps_and_loop_penalties(monkeypatch):
     steps = [
         _step(1, "CC(=O)O>>CCCO", "Esterification", [2]),
@@ -211,4 +252,3 @@ def test_common_lab_reagent_allowlist_is_opt_in_and_canonical():
     assert is_common_lab_reagent("C[Si](C)(C)Cl")
     assert is_common_lab_reagent("O")
     assert not is_common_lab_reagent(Chem.MolToSmiles(Chem.MolFromSmiles("CCO")))
-
