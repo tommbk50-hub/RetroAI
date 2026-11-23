@@ -1,6 +1,7 @@
 # RetroAI architecture
 
 - `retroai/core/`: startup configuration, per-workbench state, Pydantic schemas, RDKit utilities, and identifier resolution.
+- `retroai/cbyd/`: optional CbyD route parsing, condition/yield normalization, hazard tagging, and release-aware DuckDB ingestion.
 - `retroai/ord/`: reaction fingerprints, SMARTS/ΔFG gates, ORD parsing, and DuckDB precedent indexing.
 - `retroai/ai/`: Gemini structured output, step classification, and Crossref/Europe PMC citation verification.
 - `retroai/engine/`: lazy AiZynthFinder setup, route search/scoring, and memory cleanup.
@@ -11,6 +12,9 @@
 - `retroai/ord/fingerprints.py`: packed RDKit/DRFP reaction fingerprints, multiplicity-aware functional-group deltas, progressive SMARTS gates, and reaction-core/scaffold extraction.
 - `retroai/ord/parser.py`: offline ORD protobuf normalization, salt stripping, spectator classification, and precomputed fingerprint/ΔFG features.
 - `retroai/ord/validator.py`: DuckDB schema migration/backfill, in-memory DRFP index, exact/DRFP/chemical validation funnel, online ORD retrieval, and Hugging Face protobuf-shard ingestion.
+- `retroai/cbyd/parser.py`: CbyD step normalization, structured yield/condition parsing, spectator functional groups, and deterministic academic hazard flags.
+- `retroai/cbyd/ingest.py`: offline route JSON filtering/deduplication, `cbyd_reactions` persistence, and CbyD release metadata.
+- `tests/test_cbyd.py`: offline CbyD ingestion, provenance, chemoselective fallback, multi-step yield, and hazard coverage.
 - `retroai/core/chem_utils.py`: shared primary-molecule extraction and chemistry analytics used by ORD and UI callers.
 - `tests/test_ord_validator.py`: offline ORD pipeline, migration, matching, persistence, and integration coverage; tests must not fetch live data.
 - `pyproject.toml`: canonical runtime and test dependencies; `requirements.txt` installs the editable project and repeats the explicit DRFP pin.

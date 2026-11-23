@@ -14,10 +14,8 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 
 from retroai.core.chem_utils import _extract_primary_smiles
 
-try:
-    from drfp import DrfpEncoder
-except ImportError:  # DRFP is optional only for lightweight/offline development imports.
-    DrfpEncoder = None
+DrfpEncoder = None
+_DRFP_IMPORT_ATTEMPTED = False
 
 
 _SMARTSRX_URL = "https://raw.githubusercontent.com/MolecularAI/smartsrx/main/smartsrx.json"
@@ -70,6 +68,14 @@ def compute_folded_rxn_fp(rxn_smiles: str, n_bits: int = 2048) -> Optional[bytes
 
 def compute_drfp_bytes(rxn_smiles: str, n_bits: int = 2048, radius: int = 3) -> Optional[bytes]:
     """Compute a packed DRFP reaction fingerprint, or return ``None`` when unavailable."""
+    global DrfpEncoder, _DRFP_IMPORT_ATTEMPTED
+    if not _DRFP_IMPORT_ATTEMPTED:
+        _DRFP_IMPORT_ATTEMPTED = True
+        try:
+            from drfp import DrfpEncoder as encoder
+        except ImportError:
+            encoder = None
+        DrfpEncoder = encoder
     if DrfpEncoder is None or n_bits <= 0 or n_bits % 8:
         return None
     try:
