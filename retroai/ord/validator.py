@@ -382,11 +382,11 @@ class ORDRetrosynthesisValidator:
             columns = [col[0] for col in cursor.description]
             rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
 
-        query_spectators = compute_spectator_functional_groups(s)["survived"]
-        query_tags = set(query_spectators)
+        query_spectators = compute_spectator_functional_groups(s)
+        query_tags = set(query_spectators["survived"])
         admitted = []
         for rec in rows:
-            rxn = rec.get("rxn_smiles") or rec.get("canonical_reaction") or ""
+            rxn = rec.get("canonical_reaction") or rec.get("rxn_smiles") or ""
             gate = _match_ord_gate(
                 *_parse_reaction_mols(rxn),
                 (_counter_from_json(rec.get("consumed_fgs")), _counter_from_json(rec.get("formed_fgs")), Counter()),

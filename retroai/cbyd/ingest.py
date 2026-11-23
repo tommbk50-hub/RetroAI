@@ -74,35 +74,46 @@ def ensure_cbyd_schema(con):
     con.execute("CREATE INDEX IF NOT EXISTS idx_cbyd_conn ON cbyd_reactions (prod_connectivity)")
 
 
-def _collect_route_tree_flags(route_tree_path: str | os.PathLike | None) -> tuple[set[str], set[str]]:
-    """Read optional route-tree validity flags without requiring the generated trees."""
+def _collect_route_tree_flags(
+    route_tree_path: str | os.PathLike | None,
+) -> tuple[set[str], set[str], set[str]]:
+    """Return represented routes, flagged routes, and reachable reaction IDs."""
     if not route_tree_path:
-        return set(), set()
-    route_stems, reaction_ids = set(), set()
-    try:
-        with Path(route_tree_path).open(encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
+        return set(), set(), set()
+    represented_routes, flagged_routes, reachable_reactions = set(), set(), set()
+    with Path(route_tree_path).open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
                 record = json.loads(line)
-                route_id = str(record.get("id") or "")
-                warning = record.get("warnings") or record.get("warning")
-                if bool(record.get("invalid")) or bool(record.get("orphan")) or warning:
-                    route_stems.add(route_id)
-                stack = [record]
-                while stack:
-                    item = stack.pop()
-                    if isinstance(item, dict):
-                        if any(bool(item.get(flag)) for flag in ("invalid", "warning", "orphan")):
-                            rid = item.get("reaction_id")
-                            if rid:
-                                reaction_ids.add(str(rid))
-                        stack.extend(item.values())
-                    elif isinstance(item, list):
-                        stack.extend(item)
-    except (OSError, ValueError, TypeError):
-        pass
-    return route_stems, reaction_ids
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"Invalid CbyD route-tree JSON on line {line_number}: {exc}"
+                ) from exc
+            if not isinstance(record, dict) or not record.get("id"):
+                raise ValueError(
+                    f"CbyD route-tree line {line_number} must be an object with an id"
+                )
+            route_id = str(record["id"])
+            represented_routes.add(route_id)
+            if any(record.get(flag) for flag in ("invalid", "warning", "warnings", "orphan")):
+                flagged_routes.add(route_id)
+            stack = [record]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, dict):
+                    flagged = any(
+                        item.get(flag)
+                        for flag in ("invalid", "warning", "warnings", "orphan")
+                    )
+                    reaction_id = item.get("reaction_id")
+                    if reaction_id and not flagged and item.get("type") == "reaction":
+                        reachable_reactions.add(str(reaction_id))
+                    stack.extend(item.values())
+                elif isinstance(item, list):
+                    stack.extend(item)
+    return represented_routes, flagged_routes, reachable_reactions
 
 
 def ingest_cbyd_routes(
@@ -118,10 +129,12 @@ def ingest_cbyd_routes(
     paths = sorted(route_dir.glob("*.json"))
     if not paths:
         raise FileNotFoundError(f"No CbyD route JSON files found in {route_dir}")
-    skipped_routes, skipped_reactions = _collect_route_tree_flags(route_tree_jsonl)
+    represented_routes, skipped_routes, reachable_reactions = _collect_route_tree_flags(route_tree_jsonl)
     records, skipped = {}, {"invalid": 0, "low_confidence_or_unparseable": 0, "duplicate": 0}
     for path in paths:
-        if path.stem in skipped_routes:
+        if route_tree_jsonl and (
+            path.stem in skipped_routes or path.stem not in represented_routes
+        ):
             skipped["invalid"] += 1
             continue
         try:
@@ -131,7 +144,7 @@ def ingest_cbyd_routes(
             continue
         background = route.get("background") or {}
         for step in route.get("synthesis") or []:
-            if str(step.get("reaction_id") or "") in skipped_reactions:
+            if route_tree_jsonl and str(step.get("reaction_id") or "") not in reachable_reactions:
                 skipped["invalid"] += 1
                 continue
             parsed = parse_cbyd_step(
@@ -156,6 +169,7 @@ def ingest_cbyd_routes(
         ensure_cbyd_schema(con)
         con.execute("BEGIN")
         try:
+            con.execute("DELETE FROM cbyd_reactions")
             for record in records.values():
                 values = [record[name] for name in CBYD_SCHEMA]
                 placeholders = ",".join("?" for _ in CBYD_SCHEMA)

@@ -72,8 +72,18 @@ def _scale_route_eln(route, target_smiles, scale_g, yield_override=None):
         step_yield = override if override is not None else _clamp_step_yield(step.get("assumed_step_yield"))
         if step_yield is None or step_yield <= 0:
             return []
+        primary_provider = next(iter((step.get("ord_validation") or {}).get("top_precedents") or []), {}).get("provider")
+        ingredients = _merge_step_stoichiometry(
+            smi,
+            step.get("reagent_stoichiometry"),
+            allow_defaults=primary_provider != "CbyD",
+        )
+        if primary_provider == "CbyD" and any(
+            row["role"] == "Reactant" and row["equivalents"] <= 0 for row in ingredients
+        ):
+            return []
         plans.append({"step": step, "product": product, "product_mw": Descriptors.MolWt(products[0]),
-                      "ingredients": _merge_step_stoichiometry(smi, step.get("reagent_stoichiometry")),
+                      "ingredients": ingredients,
                       "yield": step_yield})
     final_steps = producers.get(_canonical_molecule_smiles(target))
     if not final_steps:
@@ -169,7 +179,10 @@ def _eln_step_text(plan, *, markdown):
     else:
         lines.append("\t".join(_ELN_COLUMNS))
         lines.extend("\t".join(" ".join(cell.split()) for cell in row) for row in _eln_step_rows(plan))
-    lines.extend(["", "Planning basis: unreported reactant charges default to 1 eq. Verify analog loadings and unknown amounts before use."])
+    if step.get("cbyd_precedents"):
+        lines.extend(["", "CbyD does not report stoichiometry/time/workup. Check DOI for stoichiometry/time/workup."])
+    else:
+        lines.extend(["", "Planning basis: unreported reactant charges default to 1 eq. Verify analog loadings and unknown amounts before use."])
     if step.get("experimental_procedure"):
         label = "**Draft procedure:** " if markdown else "Draft procedure: "
         lines.extend(["", label + text_field(step["experimental_procedure"])])
@@ -328,6 +341,7 @@ def _render_ord_step_panel_html(ov: dict, verified_literature=()) -> str:
     prec_cards = []
     for p in ov.get("top_precedents", []):
         oid = p.get("ord_id", "ord")
+        provenance = p.get("provenance") or p.get("provider") or "ORD"
         oid_html = _render_step_source(oid, {oid} if p.get("provider") != "CbyD" else set(), ())
         sim = p.get("similarity", 0.0)
         y_str = f"{p['yield_pct']:.0f}%" if p.get("yield_pct") is not None else "N/A"
@@ -367,7 +381,7 @@ def _render_ord_step_panel_html(ov: dict, verified_literature=()) -> str:
         prec_cards.append(
             f"<div style='background:#ffffff;border:1px solid #bae6fd;border-radius:6px;padding:6px 8px;margin-top:5px;'>"
             f"<div style='font-size:10.5px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px;'>"
-            f"<span>{oid_html} · Sim <b>{sim:.2f}</b> · Yield <b>{y_str}</b> · {cond_summary}</span>"
+            f"<span><b>{html.escape(provenance)}</b> · {oid_html} · Sim <b>{sim:.2f}</b> · Yield <b>{y_str}</b> · {cond_summary}</span>"
             f"<span>{ref_html}</span>"
             f"</div>"
             f"{rxn_svg_html}"
@@ -1567,6 +1581,15 @@ class _Workbench:
             return [], "Route index out of range."
         route = routes[int(route_idx) - 1]
         plans = _scale_route_eln(route, res.get("target_smiles", ""), float(target_scale_grams), assumed_step_yield)
+        if not plans and any(
+            next(iter((step.get("ord_validation") or {}).get("top_precedents") or []), {}).get("provider") == "CbyD"
+            and any(
+                row.get("role") == "Reactant" and not row.get("equivalents")
+                for row in step.get("reagent_stoichiometry") or []
+            )
+            for step in route.get("steps", [])
+        ):
+            return [], "Check DOI for stoichiometry/time/workup before generating a numeric CbyD ELN charge."
         if not plans and assumed_step_yield is None and any(
             _clamp_step_yield(step.get("assumed_step_yield")) in (None, 0.0)
             for step in route.get("steps", [])
@@ -1598,12 +1621,17 @@ class _Workbench:
         res = deduplicate_retro_state(self.state.latest_retro_results)
         target = res.get("target_smiles") or self.state.canvas_target_smiles or "None"
         routes = res.get("routes", [])
+        cbyd_size = getattr(self.ord_validator, "get_cbyd_index_size", lambda: 0)()
         if not routes:
-            return f"Active Target SMILES: {target}\nORD DuckDB Index Size: {self.ord_validator.get_index_size()} reactions\nNo retrosynthesis routes have been generated yet."
+            return (
+                f"Active Target SMILES: {target}\nORD DuckDB Index Size: "
+                f"{self.ord_validator.get_index_size()} reactions | CbyD Index Size: "
+                f"{cbyd_size} reactions\nNo retrosynthesis routes have been generated yet."
+            )
         lines = [
             f"Active Target SMILES: {target}",
             f"Search Algorithm: {res.get('search_algorithm', 'retrostar')} | Ranking Profile: {res.get('ranking_mode', 'balanced')} | Target Scale: {res.get('target_scale_grams', 1.0)} g",
-            f"ORD DuckDB Index Size: {self.ord_validator.get_index_size()} reactions | Locked Substructure SMARTS: {res.get('locked_substructure_smarts') or 'None'} | Excluded Reactions: {', '.join(res.get('excluded_reactions') or []) or 'None'}",
+            f"ORD DuckDB Index Size: {self.ord_validator.get_index_size()} reactions | CbyD Index Size: {cbyd_size} reactions | Locked Substructure SMARTS: {res.get('locked_substructure_smarts') or 'None'} | Excluded Reactions: {', '.join(res.get('excluded_reactions') or []) or 'None'}",
             f"Total Extracted Routes: {len(routes)}\n",
         ]
         for idx, r in enumerate(routes, start=1):
@@ -1625,6 +1653,34 @@ class _Workbench:
                     f"Mean Yield: {ov.get('mean_analog_yield_pct')}%, HTE Fail <15%: {ov.get('hte_failure_rate_pct')}%) | "
                     f"Conditions: {s['typical_conditions']} | Safety: {s['safety_green_score']}/5 | "
                     f"Selectivity/ORD Warning: {s['selectivity_warning']}"
+                )
+                cbyd_hits = [
+                    {
+                        "reaction_id": hit.get("precedent_id"),
+                        "similarity": hit.get("similarity"),
+                        "doi": hit.get("doi"),
+                        "citation": hit.get("citation"),
+                        "tolerated_functional_groups": hit.get("tolerated_functional_groups"),
+                        "conditions": {
+                            "catalysts": hit.get("catalysts"),
+                            "ligands": hit.get("ligands"),
+                            "solvents": hit.get("solvents"),
+                            "temperature": hit.get("temperature"),
+                            "yield": hit.get("yield_raw") or hit.get("yield_pct"),
+                            "step_count": hit.get("step_count"),
+                            "dr": hit.get("dr"),
+                            "ee": hit.get("ee"),
+                        },
+                        "hazard_flags": hit.get("hazard_flags"),
+                    }
+                    for hit in (ov.get("top_precedents") or [])
+                    if hit.get("provider") == "CbyD"
+                ][:3]
+                lines.append(
+                    "    Functional-group audit: "
+                    + json.dumps(ov.get("functional_group_audit") or {}, sort_keys=True)
+                    + " | CbyD precedents: "
+                    + json.dumps(cbyd_hits, ensure_ascii=False, sort_keys=True)
                 )
         return "\n".join(lines)
 

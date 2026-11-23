@@ -216,7 +216,7 @@ def compute_rdkit_internal_delta_fg(rxn_smiles):
 
 @functools.lru_cache(maxsize=4096)
 def compute_spectator_functional_groups(rxn_smiles):
-    """Count selected groups on each side and the groups that survive intact."""
+    """Count groups and, for mapped reactions, identify exact mapped survival."""
     reactants, products = _parse_reaction_mols(rxn_smiles)
     if not reactants or not products:
         return {"reactant": {}, "product": {}, "survived": {}}
@@ -226,19 +226,42 @@ def compute_spectator_functional_groups(rxn_smiles):
         if (query := Chem.MolFromSmarts(smarts)) is not None
     )
 
-    def count_side(mols):
-        counts = Counter()
+    def occurrences(mols):
+        counts, mapped = Counter(), defaultdict(list)
         for mol in mols:
             for name, query in queries:
-                counts[name] += len(mol.GetSubstructMatches(query, uniquify=True))
-        return counts
+                matches = mol.GetSubstructMatches(query, uniquify=True)
+                if matches:
+                    counts[name] += len(matches)
+                for match in matches:
+                    map_set = frozenset(
+                        mol.GetAtomWithIdx(idx).GetAtomMapNum()
+                        for idx in match
+                        if mol.GetAtomWithIdx(idx).GetAtomMapNum()
+                    )
+                    if map_set and len(map_set) == len(match):
+                        mapped[name].append(map_set)
+        return counts, mapped
 
-    reactant, product = count_side(reactants), count_side(products)
-    survived = reactant & product
+    reactant, reactant_mapped = occurrences(reactants)
+    product, product_mapped = occurrences(products)
+    surviving_counts = Counter()
+    has_mapping = any(reactant_mapped.values()) and any(product_mapped.values())
+    if has_mapping:
+        for name in reactant_mapped:
+            remaining = Counter(product_mapped.get(name, ()))
+            for atom_maps in reactant_mapped[name]:
+                if remaining[atom_maps]:
+                    surviving_counts[name] += 1
+                    remaining[atom_maps] -= 1
+    else:
+        # Unmapped user reactions cannot prove atom identity; use class overlap only as
+        # a lower-confidence audit signal while mapped precedents use exact atom maps.
+        surviving_counts = reactant & product
     return {
         "reactant": dict(sorted(reactant.items())),
         "product": dict(sorted(product.items())),
-        "survived": dict(sorted(survived.items())),
+        "survived": dict(sorted(surviving_counts.items())),
     }
 
 

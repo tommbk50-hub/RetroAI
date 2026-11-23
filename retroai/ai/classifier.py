@@ -39,7 +39,7 @@ MAX_STEP_CACHE_SIZE = 250
 _USPTO_FG_SOURCE = "USPTO/ΔFG Standard"
 
 
-def _merge_step_stoichiometry(forward_smiles, ingredients):
+def _merge_step_stoichiometry(forward_smiles, ingredients, *, allow_defaults=True):
     """Keep the limiting charge basis when transferring measured loadings to exact substrates."""
     reactants, _ = _parse_reaction_mols(forward_smiles)
     species = [(_canonical_molecule_smiles(mol), Descriptors.MolWt(mol)) for mol in reactants]
@@ -69,11 +69,17 @@ def _merge_step_stoichiometry(forward_smiles, ingredients):
     rows = []
     for i, (smi, mw) in enumerate(species):
         row = charges[assigned[i]][1] if i in assigned else {}
-        eq = row.get("equivalents", 0.0) if limiting is not None and i != limiting else 1.0
+        if allow_defaults:
+            eq = row.get("equivalents", 0.0) if limiting is not None and i != limiting else 1.0
+            eq = eq or 1.0
+        else:
+            eq = 0.0
         rows.append({"name": row.get("name") or _CANON_SMILES_TO_NAME.get(smi, smi), "role": "Reactant",
-                     "smiles_or_formula": smi, "mw_g_mol": mw, "equivalents": eq or 1.0, "molarity_m": 0.0})
-    if limiting is not None:
+                     "smiles_or_formula": smi, "mw_g_mol": mw, "equivalents": eq, "molarity_m": 0.0})
+    if limiting is not None and allow_defaults:
         rows.insert(0, rows.pop(limiting))
+    if not allow_defaults:
+        additives = [dict(row, equivalents=0.0, molarity_m=0.0) for row in additives]
     return rows + additives
 
 
@@ -209,22 +215,36 @@ def rdkit_classify_step(
         warnings.append("Competing amine and hydroxyl nucleophiles; verify chemoselectivity.")
     if ov.get("negative_data_warning", "None") != "None":
         warnings.append(ov["negative_data_warning"])
-    hazards = list(primary.get("hazard_flags") or [])
-    alternatives = list(primary.get("safer_alternatives") or [])
+    hazards = list(dict.fromkeys(
+        hazard
+        for hit in hits if hit.get("provider") == "CbyD"
+        for hazard in (hit.get("hazard_flags") or [])
+    ))
+    alternatives = list(dict.fromkeys(
+        alternative
+        for hit in hits if hit.get("provider") == "CbyD"
+        for alternative in (hit.get("safer_alternatives") or [])
+    ))
     data_gaps = []
-    if primary.get("provider") == "CbyD":
+    cbyd_hits = [hit for hit in hits if hit.get("provider") == "CbyD"]
+    if cbyd_hits:
         data_gaps.append("Check DOI for stoichiometry/time/workup")
-        if primary.get("step_count", 1) > 1:
+        if any(hit.get("step_count", 1) > 1 for hit in cbyd_hits):
             data_gaps.append(
-                f"Telescoped {int(primary['step_count'])}-step CbyD yield is not used as a single-step score."
+                "Telescoped multi-step CbyD yield is not used as a single-step score."
             )
-        if primary.get("is_borsm"):
+        if any(hit.get("is_borsm") for hit in cbyd_hits):
             data_gaps.append("CbyD yield is based on recovered starting material (BORSM).")
     if hazards:
         warnings.extend(hazards)
     info = StepClassificationItem(
         forward_smiles=s, reaction_name=keywords.replace(" OR ", " / ") or "USPTO / RDKit reaction step",
-        ranked_conditions=ranked, reagent_stoichiometry=_merge_step_stoichiometry(s, primary.get("reagent_stoichiometry", [])),
+        ranked_conditions=ranked,
+        reagent_stoichiometry=_merge_step_stoichiometry(
+            s,
+            primary.get("reagent_stoichiometry", []),
+            allow_defaults=primary.get("provider") != "CbyD",
+        ),
         safety_green_score=max(1, 3 - len(set(hazards))), greener_solvent_swap="; ".join(alternatives) or "None",
         selectivity_warning=" | ".join(warnings) or "None", experimental_procedure="",
         assumed_step_yield=_clamp_step_yield(mean / 100) if mean is not None else None,
@@ -266,6 +286,7 @@ def _verified_step_context(smi, info, template_info=None):
     ov = info["ord_validation"]
     hits = ov.get("top_precedents", []) if ov.get("smarts_matched_count") else []
     records, literature, allowed = [], [], set()
+    procedure_sources = set()
     for hit in hits:
         record = {k: v for k, v in hit.items() if k not in {"reference", "doi", "patent_id"}}
         if hit.get("ord_id"):
@@ -283,6 +304,15 @@ def _verified_step_context(smi, info, template_info=None):
             record["doi"] = work["doi"]
         if hit.get("doi"):
             allowed.add(hit["doi"])
+        if (hit.get("procedure_details") or "").strip():
+            procedure_sources.update(
+                source for source in (
+                    hit.get("ord_id"),
+                    hit.get("precedent_id"),
+                    hit.get("doi"),
+                    hit.get("patent_id"),
+                ) if source
+            )
         records.append(record)
     classification = _step_transformation_keywords(ov.get("rdkit_delta_fg_signature", {}), template_info)
     if not any(record.get("procedure_details", "").strip() for record in records):
@@ -301,6 +331,7 @@ def _verified_step_context(smi, info, template_info=None):
         "verified_precedents": records, "verified_ord_precedents": records,
         "crossref_verified_literature": literature,
         "allowed_citations": sorted(allowed), "primary_stoichiometry_baseline": info["reagent_stoichiometry"],
+        "procedure_sources": sorted(procedure_sources),
         "predicted_ipc_masses": [{"role": row["role"], "smiles": row["smiles"], "[M+H]+ m/z": row["[M+H]+"]}
                                  for row in analytics["lcms"]], "predicted_workup": analytics["workup"],
     }
@@ -386,14 +417,45 @@ def batch_classify_with_gemini(
             if (source and source not in allowed) or citations - allowed - {_USPTO_FG_SOURCE}:
                 continue  # Reject the claims along with the unverified sources, not just the citation fields.
             info["source_doi_or_patent"] = source
-            if not source:
+            if not source or source not in set(contexts[smi]["procedure_sources"]):
                 info["experimental_procedure"] = ""
             for condition in info["ranked_conditions"]:
                 condition["citation_or_ord_id"] = condition["citation_or_ord_id"].strip()
                 if condition["citation_or_ord_id"] == _USPTO_FG_SOURCE:
                     condition["condition_label"] = "Unvalidated proposal: " + condition["condition_label"]
+            baseline_cbyd_conditions = {
+                condition["citation_or_ord_id"]: condition
+                for condition in results[smi]["ranked_conditions"]
+                if any(
+                    hit.get("doi") and condition["citation_or_ord_id"] == hit["doi"]
+                    for hit in results[smi]["ord_validation"].get("top_precedents", [])
+                    if hit.get("provider") == "CbyD"
+                )
+            }
+            for condition in info["ranked_conditions"]:
+                baseline = baseline_cbyd_conditions.get(condition["citation_or_ord_id"])
+                if baseline:
+                    condition["temp_and_time"] = baseline["temp_and_time"]
+                    condition["expected_yield_range"] = baseline["expected_yield_range"]
+            if info["ranked_conditions"]:
+                primary = sorted(info["ranked_conditions"], key=lambda row: row["rank"])[0]
+                info["typical_conditions"] = (
+                    f"Cat/ligand: {primary['catalyst_and_ligand']} · "
+                    f"Base/reagents: {primary['base_or_reagent']} · "
+                    f"Solvent: {primary['solvent_and_molarity']} · {primary['temp_and_time']}"
+                )
+            info["safety_green_score"] = min(
+                info["safety_green_score"], results[smi]["safety_green_score"]
+            )
             info["assumed_step_yield"] = results[smi]["assumed_step_yield"]
-            info["reagent_stoichiometry"] = _merge_step_stoichiometry(smi, info["reagent_stoichiometry"])
+            info["reagent_stoichiometry"] = _merge_step_stoichiometry(
+                smi,
+                info["reagent_stoichiometry"],
+                allow_defaults=(
+                    next(iter(results[smi]["ord_validation"].get("top_precedents") or []), {}).get("provider")
+                    != "CbyD"
+                ),
+            )
             for field in ("cbyd_precedents", "hazard_flags", "safer_alternatives", "data_gap_warnings"):
                 info[field] = results[smi].get(field, [])
             results[smi].update(info, gemini_enriched=True, gemini_tag=tag,

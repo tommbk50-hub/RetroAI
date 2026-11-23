@@ -1,10 +1,13 @@
 import json
+from types import SimpleNamespace
 
 import duckdb
 
 from retroai.ai import classifier
+from retroai.core.state import WorkbenchState
 from retroai.cbyd.ingest import ingest_cbyd_routes
-from retroai.cbyd.parser import parse_yield_fields
+from retroai.cbyd.parser import assess_condition_hazards, parse_cbyd_step, parse_yield_fields
+from retroai.ord.fingerprints import compute_spectator_functional_groups
 from retroai.ord.validator import ORDRetrosynthesisValidator
 
 
@@ -49,6 +52,26 @@ def test_yield_parser_preserves_telescoped_and_selectivity_fields():
     borsm = parse_yield_fields(["64% (BORSM)"])
     assert borsm["is_borsm"]
     assert borsm["yield_pct"] == 64.0
+    assert parse_yield_fields(["96% ee, 75% yield"])["yield_pct"] == 75.0
+
+
+def test_cbyd_standardization_strips_salt_and_tracks_mapped_survival():
+    step = _route("salted")["synthesis"][0]
+    step["reaction_smiles_mapped"] = "CC[OH:1].[Cl-]>>CC=[O:1]"
+    parsed = parse_cbyd_step(
+        step, _route("salted")["background"], min_mapping_confidence=0.5
+    )
+    assert parsed["canonical_reaction"] == "CCO>>CC=O"
+
+    shifted = compute_spectator_functional_groups(
+        "[CH2:1]=[CH2:2].[CH2:3][CH2:4]>>[CH2:1][CH2:2].[CH2:3]=[CH2:4]"
+    )
+    assert shifted["reactant"]["alkene"] == 1
+    assert shifted["product"]["alkene"] == 1
+    assert "alkene" not in shifted["survived"]
+    assert "Osmium" in " ".join(
+        assess_condition_hazards(catalysts=["OsO4"])["hazard_flags"]
+    )
 
 
 def test_cbyd_ingestion_deduplicates_filters_and_records_metadata(tmp_path):
@@ -83,8 +106,53 @@ def test_cbyd_ingestion_deduplicates_filters_and_records_metadata(tmp_path):
     assert json.loads(row[3]) == {}
     assert release == "v2026.11"
 
+    for path in routes.glob("*.json"):
+        path.unlink()
+    (routes / "replacement.json").write_text(
+        json.dumps(_route("replacement", mapped="CCCO>>CCC=O")), encoding="utf-8"
+    )
+    ingest_cbyd_routes(routes, db_path, release_version="v2026.12")
+    with duckdb.connect(str(db_path)) as con:
+        assert con.execute(
+            "SELECT reaction_id, release_version FROM cbyd_reactions"
+        ).fetchall() == [("replacement", "v2026.12")]
 
-def test_validator_rescues_step_with_cbyd_without_counting_telescoped_yield(tmp_path):
+
+def test_ingestion_uses_route_tree_reachability_and_rejects_bad_jsonl(tmp_path):
+    routes = tmp_path / "routes"
+    routes.mkdir()
+    route = _route("keep")
+    route["synthesis"].append(dict(_route("orphan")["synthesis"][0], reaction_id="orphan"))
+    (routes / "route.json").write_text(json.dumps(route), encoding="utf-8")
+    route_tree = tmp_path / "route_tree.jsonl"
+    route_tree.write_text(json.dumps({
+        "id": "route",
+        "type": "mol",
+        "children": [{
+            "type": "reaction",
+            "reaction_id": "keep",
+            "children": [],
+        }],
+    }) + "\n", encoding="utf-8")
+    db_path = tmp_path / "tree.duckdb"
+
+    result = ingest_cbyd_routes(
+        routes, db_path, route_tree_jsonl=route_tree, release_version="v2026.11"
+    )
+    assert result["parsed"] == 1
+    with duckdb.connect(str(db_path)) as con:
+        assert con.execute("SELECT reaction_id FROM cbyd_reactions").fetchall() == [("keep",)]
+
+    route_tree.write_text("{not json}\n", encoding="utf-8")
+    try:
+        ingest_cbyd_routes(routes, db_path, route_tree_jsonl=route_tree)
+    except ValueError as exc:
+        assert "Invalid CbyD route-tree JSON" in str(exc)
+    else:
+        raise AssertionError("Malformed route tree JSON must fail visibly")
+
+
+def test_validator_rescues_step_with_cbyd_without_counting_telescoped_yield(tmp_path, monkeypatch):
     routes = tmp_path / "routes"
     routes.mkdir()
     (routes / "route.json").write_text(
@@ -116,3 +184,30 @@ def test_validator_rescues_step_with_cbyd_without_counting_telescoped_yield(tmp_
     assert classified["data_gap_warnings"][0] == "Check DOI for stoichiometry/time/workup"
     assert "telescoped 2-step yield" in classified["ranked_conditions"][0]["expected_yield_range"]
     assert classified["cbyd_precedents"][0]["step_count"] == 2
+    assert all(
+        row["equivalents"] == 0
+        for row in classified["reagent_stoichiometry"]
+        if row["role"] == "Reactant"
+    )
+
+    proposed = json.loads(json.dumps(classified))
+    proposed["experimental_procedure"] = "Invented procedure"
+    proposed["source_doi_or_patent"] = "10.1000/example"
+    response = SimpleNamespace(text=json.dumps({"steps": [proposed]}))
+    monkeypatch.setattr(classifier, "get_gemini_client", object)
+    monkeypatch.setattr(classifier, "fetch_verified_literature_dois", lambda *args: [])
+    monkeypatch.setattr(
+        classifier,
+        "call_gemini_with_config",
+        lambda **kwargs: (response, "test-model", "medium"),
+    )
+    enriched = classifier.batch_classify_with_gemini(
+        [OXIDATION], state=WorkbenchState(), ord_validator=validator
+    )[OXIDATION]
+    assert enriched["gemini_enriched"]
+    assert enriched["experimental_procedure"] == ""
+    assert all(
+        row["equivalents"] == 0
+        for row in enriched["reagent_stoichiometry"]
+        if row["role"] == "Reactant"
+    )

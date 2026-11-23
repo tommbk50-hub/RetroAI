@@ -3,6 +3,7 @@
 import json
 import re
 from collections.abc import Mapping
+from functools import lru_cache
 
 from rdkit import Chem
 
@@ -30,6 +31,20 @@ _RESTRICTED_SOLVENTS = {
     "et2o": ("Et2O", "Screen 2-MeTHF or MTBE, including peroxide and flammability controls."),
     "pyridine": ("pyridine", "Screen a lower-hazard non-nucleophilic base/solvent combination."),
 }
+_SPECTATOR_SALT_SMILES = (
+    "Cl", "[Cl-]", "Br", "[Br-]", "I", "[I-]", "F", "[F-]",
+    "[Na+]", "[K+]", "[Li+]", "[NH4+]", "O",
+)
+
+
+@lru_cache(maxsize=1)
+def _spectator_salt_keys():
+    keys = set()
+    for smiles in _SPECTATOR_SALT_SMILES:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is not None:
+            keys.add(Chem.MolToSmiles(mol, canonical=True))
+    return keys
 
 
 def _as_list(value) -> list:
@@ -47,7 +62,11 @@ def parse_yield_fields(value) -> dict:
     """Parse the reported CbyD yield without erasing multi-step/BORSM semantics."""
     texts = _as_list(value)
     raw = "; ".join(str(item).strip() for item in texts if str(item).strip())
-    pct_matches = re.findall(r"(?<![\d.])(\d+(?:\.\d+)?)\s*%", raw)
+    pct_matches = re.findall(
+        r"(?<![\d.])(\d+(?:\.\d+)?)\s*%(?!\s*(?:ee|er)\b)",
+        raw,
+        flags=re.I,
+    )
     step_matches = re.findall(r"(\d+)\s*steps?", raw, flags=re.I)
     yield_pct = float(pct_matches[0]) if pct_matches else None
     return {
@@ -55,9 +74,9 @@ def parse_yield_fields(value) -> dict:
         "yield_pct": yield_pct,
         "step_count": int(step_matches[0]) if step_matches else 1,
         "is_borsm": bool(re.search(r"\bBORSM\b", raw, flags=re.I)),
-        "dr": next((m.group(0).strip() for m in re.finditer(r"\b\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?\s*(?:dr|d\.?r\.?)\b", raw, flags=re.I)), ""),
+        "dr": next((m.group(0).strip() for m in re.finditer(r"\b(?:dr|d\.?r\.?)\s*\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?\b|\b\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?\s*(?:dr|d\.?r\.?)\b", raw, flags=re.I)), ""),
         "ee": next((m.group(0).strip() for m in re.finditer(r"\b\d+(?:\.\d+)?\s*%\s*ee\b", raw, flags=re.I)), ""),
-        "er": next((m.group(0).strip() for m in re.finditer(r"\b\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?\s*(?:er|e\.?r\.?)\b", raw, flags=re.I)), ""),
+        "er": next((m.group(0).strip() for m in re.finditer(r"\b(?:er|e\.?r\.?)\s*\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?\b|\b\d+(?:\.\d+)?\s*:\s*\d+(?:\.\d+)?\s*(?:er|e\.?r\.?)\b", raw, flags=re.I)), ""),
     }
 
 
@@ -65,15 +84,35 @@ def _standardize_reaction(mapped_reaction: str) -> tuple[str, str]:
     parts = mapped_reaction.split(">")
     if len(parts) != 3:
         return "", ""
+    salt_keys = _spectator_salt_keys()
+    product_maps = set()
+    for component in parts[-1].split("."):
+        mol = Chem.MolFromSmiles(component.strip())
+        if mol is not None and any(atom.GetAtomicNum() == 6 for atom in mol.GetAtoms()):
+            product_maps.update(atom.GetAtomMapNum() for atom in mol.GetAtoms() if atom.GetAtomMapNum())
+
+    def standardize_side(side):
+        components = []
+        for raw in side.split("."):
+            mol = Chem.MolFromSmiles(raw.strip())
+            if mol is None:
+                return []
+            canonical = _standardize_primary_smiles(raw.strip())
+            atom_maps = {atom.GetAtomMapNum() for atom in mol.GetAtoms() if atom.GetAtomMapNum()}
+            components.append((canonical, canonical in salt_keys, atom_maps, sum(
+                atom.GetAtomicNum() == 6 for atom in mol.GetAtoms()
+            )))
+        has_organic = any(carbons > 1 for _, _, _, carbons in components)
+        if has_organic:
+            components = [
+                item for item in components
+                if not item[1] or bool(item[2] & product_maps)
+            ]
+        return sorted(dict.fromkeys(item[0] for item in components if item[0]))
+
     sides = []
     for side in (parts[0], parts[-1]):
-        standardized = sorted(
-            dict.fromkeys(
-                canonical
-                for component in side.split(".")
-                if (canonical := _standardize_primary_smiles(component.strip()))
-            )
-        )
+        standardized = standardize_side(side)
         if not standardized:
             return "", ""
         sides.append(".".join(standardized))
@@ -87,7 +126,9 @@ def assess_condition_hazards(catalysts=(), reagents=(), solvents=(), *, smiles=(
     flags, alternatives = [], []
     compact = re.sub(r"[\s,_-]", "", normalized)
     for metal, message in _HAZARDOUS_ELEMENTS.items():
-        if re.search(fr"\b{metal}\b", names) or re.search(fr"\[{metal}(?:[+0-9-]*)\]", names):
+        if re.search(fr"(?<![A-Za-z]){metal}(?=[A-Z0-9+\-\]\)])", names) or re.search(
+            fr"\[{metal}(?:[+0-9-]*)\]", names
+        ):
             flags.append(message)
     for token, (label, alternative) in _RESTRICTED_SOLVENTS.items():
         if token in normalized or (token in {"dcm", "dmf"} and token in compact):
@@ -129,7 +170,7 @@ def parse_cbyd_step(
     product = Chem.MolFromSmiles(_extract_primary_smiles(canonical))
     prod_connectivity = Chem.MolToInchiKey(product).split("-")[0]
     consumed, formed, _ = compute_rdkit_internal_delta_fg(canonical)
-    spectator = compute_spectator_functional_groups(canonical)
+    spectator = compute_spectator_functional_groups(normalized_mapped)
     conditions = step.get("conditions") or {}
     yields = parse_yield_fields(conditions.get("YIELD"))
     condition_fields = {
