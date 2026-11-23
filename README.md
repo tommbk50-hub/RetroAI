@@ -42,3 +42,143 @@ The notebook installs Reaction-Utils with the engine using `--no-deps` because i
 ## Live Repository Map
 <!-- AUTO-MAP:START -->
 <!-- AUTO-MAP:END -->
+
+> The generated markers above are reserved. The human-readable map below is derived from
+> `retroai/` and should be updated whenever a module, public seam, state contract, or ownership
+> boundary changes.
+
+### Runtime map
+
+```text
+Retrosynthesis_Agent.ipynb
+`- retroai.ui.workbench.launch_workbench()
+   |- initialize one WorkbenchState, the AiZynthFinder facade, and the ORD validator
+   |- register the Colab callbacks used by the embedded HTML/JavaScript UI
+   `- render the workbench
+
+Synthesis callback
+`- _Workbench._cb_run_synthesis()
+   `- retroai.engine.pipeline.run_retrosynthesis_pipeline()
+      |- engine.aizynth: get_finder(), harvest templates, flatten routes
+      |- ord.validator: prefetch/index precedents and validate steps
+      |- ai.classifier: classify steps with RDKit, then optional Gemini
+      |- ord.validator.score_route(): aggregate route evidence
+      `- workbench renderers: turn the compact result into HTML
+
+Manual reaction callback
+`- _Workbench._cb_analyze_reaction()
+   `- ord prefetch -> ai.classifier.batch_classify_with_gemini()
+      `- evidence rendering + RDKit analytical cards
+```
+
+Dependency direction is intentionally one way:
+
+```text
+ui -> engine + ai + ord + core
+engine -> ai + ord + core
+ai -> ord + core
+ord -> core
+core -> third-party runtime/chemistry libraries
+```
+
+Do not invert these layers to make a small UI or engine change convenient. In particular,
+chemistry shared by ORD and UI belongs in `core`, evidence admission belongs in `ord`, and
+Colab callback behavior belongs in `ui`.
+
+### Package file ownership
+
+| Path | Owns | Main edit locations and seams |
+| --- | --- | --- |
+| `retroai/__init__.py` | Package bootstrap | Imports `core.config` first so thread limits and the ONNX `InferenceSession` patch are installed before engine imports. Keep this file side-effect-light. |
+| `retroai/core/config.py` | Process setup, credentials, and active Gemini settings | `get_secret()`, `set_active_genai_settings()`, `GEMINI_MODEL_CATALOG`, and ONNX memory options. This module is the import-time configuration exception. |
+| `retroai/core/state.py` | One workbench session's mutable state | `WorkbenchState`, `active_route_steps()`, search defaults, route results, caches, stock, and canvas state. Pass the instance explicitly; do not replace it with notebook or module globals. |
+| `retroai/core/schemas.py` | Shared structured-output schemas and normalization | Pydantic models for condition rankings, stoichiometry, step classifications, and strategy summaries; clamps safety/yield at the schema boundary. |
+| `retroai/core/chem_utils.py` | Reusable RDKit molecule and reaction analytics | Primary-molecule extraction, descriptors, SVG cards, byproduct guesses, LC-MS ions, and workup predictions. Use here for chemistry logic needed by more than one upper layer. |
+| `retroai/core/resolver.py` | Chemical identifier resolution | `_resolve_chemical_identifier()` handles direct structures plus explicit network lookups for external identifiers. |
+| `retroai/engine/aizynth.py` | AiZynthFinder lifecycle, templates, stock, and cleanup | `get_finder()`, `_harvest_uspto_templates_from_finder()`, `_flatten_reaction_tree()`, `cleanup_aizynth_memory()`, and `register_custom_lab_stock()`. Finder loading remains lazy and requires `data/config.yml`. |
+| `retroai/engine/pipeline.py` | End-to-end route search and route-level scoring | `run_retrosynthesis_pipeline()`, `compute_composite_route_score()`, and result compaction. This is the orchestration seam between search, classification, ORD evidence, stock, and state. |
+| `retroai/ord/fingerprints.py` | Reaction fingerprints and chemical matching | Packed RDKit/DRFP fingerprints, functional-group deltas, progressive SMARTS tiers, MCS reaction centers, gate decisions, and online-search core extraction. Add chemistry-admission rules here, not in the UI. |
+| `retroai/ord/parser.py` | ORD protobuf-to-record normalization | `parse_ord_reaction_protobuf()` desalts and canonicalizes species, classifies spectators, extracts yield/conditions/provenance, normalizes stoichiometry, and precomputes indexed features. Its output is a DuckDB row contract. |
+| `retroai/ord/validator.py` | ORD persistence, ingestion, retrieval, and route confidence | `ORDRetrosynthesisValidator`, database migration/backfill, in-memory DRFP index, online/Hugging Face ingestion, `validate_step()`, and `score_route()`. Construction may create a database; imports must not. |
+| `retroai/ai/gemini_client.py` | Gemini client/configuration and fallback calls | `get_gemini_client()`, `_build_genai_config()`, and `call_gemini_with_config()`. Keep model selection and retry behavior here. |
+| `retroai/ai/classifier.py` | Step-level RDKit/ORD/Gemini enrichment | `rdkit_classify_step()`, `batch_classify_with_gemini()`, `_classify_route_steps()`, condition ranking, stoichiometry transfer, evidence context, and the per-state enrichment cache. RDKit/ORD baseline must remain usable without Gemini. |
+| `retroai/ai/literature.py` | DOI and literature verification | Crossref identity checks and Europe PMC/PubMed candidate discovery. Network access happens only when these functions are called. |
+| `retroai/ui/ketcher.py` | Ketcher asset delivery | `_ensure_ketcher_bundle()` downloads/caches the pinned bundle, serves auxiliary assets on loopback, and inlines the main document assets. |
+| `retroai/ui/workbench.py` | Colab UI, callbacks, HTML rendering, ELN scaling, and agent tools | `launch_workbench()`, `_Workbench`, route/step renderers, callback names, scaled stoichiometry, and the embedded workbench frontend. Changes to a callback must update both the HTML caller and `output.register_callback`. |
+| `retroai/{ai,core,engine,ord,ui}/__init__.py` | Package markers | Currently intentionally empty. Do not use them for database, network, model, or Colab initialization. |
+
+### Core data contracts
+
+- Reaction strings use forward synthesis orientation: `reactants>>products`.
+  AiZynthFinder supplies retrosynthetic reactions, so `engine/aizynth.py` reverses them before
+  they enter ORD and AI classification.
+- A route step carries `forward_smiles`, `step_index`, optional `precursor_steps`, and optional
+  USPTO metadata (`retro_template`, `classification`, `template_code`,
+  `mapped_forward_smiles`). `ai/classifier.py` uses that identity for caching and batches.
+- `core/state.py::WorkbenchState.latest_retro_results` is the compact session result. Routes
+  contain search/ORD scores, stock leaves, and step dictionaries; step dictionaries contain
+  `ord_validation`, structured Gemini/RDKit classification, and planning fields.
+- `WorkbenchState.active_route_steps()` is the explicit bridge from UI state to ORD shard
+  filtering. Never make `ord` read UI state or notebook globals.
+- `parse_ord_reaction_protobuf()` defines the persisted ORD record shape. A new persisted
+  field also requires a corresponding DuckDB `ALTER TABLE`/migration, index ingestion, and
+  validation or parser coverage.
+- Pydantic models in `core/schemas.py` define Gemini's JSON contract. If a step field is added,
+  update the schema first, then classification/rendering consumers.
+- `_render_routes_html_from_results()` renders SVG and HTML on demand. Store compact JSON-like
+  route data in state; do not reintroduce reaction trees, RDKit objects, or large SVG blobs.
+
+### Where to make common changes
+
+| Change | Start here | Follow-through |
+| --- | --- | --- |
+| Add or change a search constraint, route score, or stock rule | `retroai/engine/pipeline.py` | Mirror UI parameter collection in `_cb_run_synthesis()` and any agent rerun tool; cover pipeline behavior in `tests/test_ord_validator.py`. |
+| Change AiZynthFinder loading, template harvesting, or memory cleanup | `retroai/engine/aizynth.py` | Preserve lazy imports and `cleanup_aizynth_memory()` as the single tree-release path. |
+| Change ORD matching or false-positive admission | `retroai/ord/fingerprints.py` and `ORDRetrosynthesisValidator._validate_step()` | Add exact, progressive-SMARTS, and reject-counterexample tests in `tests/test_ord_validator.py`. |
+| Change ORD protobuf normalization or indexed fields | `retroai/ord/parser.py` | Update validator schema migration/backfill, bulk ingestion, and parser/migration tests together. |
+| Add an AI-enriched step field or citation rule | `retroai/core/schemas.py` and `retroai/ai/classifier.py` | Revalidate the returned object, enforce evidence allowlists, then consume it in `retroai/ui/workbench.py`. |
+| Add chemistry analytics used across tabs | `retroai/core/chem_utils.py` | Call from AI/UI rather than duplicating RDKit logic; extend `tests/test_chem_utils.py`. |
+| Add or rename a frontend action | `retroai/ui/workbench.py` | Keep the JavaScript `invokeFunction(...)` name aligned with the Python callback registration and runtime callback test. |
+| Change Ketcher behavior or asset packaging | `retroai/ui/ketcher.py` and the render/bootstrap portion of `retroai/ui/workbench.py` | Keep network/download work inside `_ensure_ketcher_bundle()`, never at module import. |
+| Add a new identifier service | `retroai/core/resolver.py` | Resolve to canonical SMILES, keep UI state out, and keep network requests explicit and mockable. |
+
+### Required boundaries
+
+1. `retroai/__init__.py` must import `core.config` first. Do not import ONNX Runtime or
+   AiZynthFinder before its memory patch.
+2. Module imports must remain usable without `google.colab`, credentials, model data, an ORD
+   database, or network access. Create the finder, validator, client, and data files only from
+   explicit calls.
+3. Online ORD workers perform HTTP I/O and return protobuf bytes. Parse protobufs and run
+   RDKit/DuckDB work on the coordinating thread, as enforced by
+   `ORDRetrosynthesisValidator.batch_prefetch_online_ord()`.
+4. Keep "no gated precedent" distinct from low-yield precedent evidence. Unvalidated steps
+   must not acquire a synthetic empirical yield or success-shaped ORD data.
+5. Gemini output is enrichment, not the evidence authority. Step responses must pass Pydantic
+   validation and citation checks in `ai/classifier.py`; an unavailable client falls back to
+   the RDKit/ORD baseline.
+6. Pass `WorkbenchState` and route steps explicitly across layers. `latest_retro_results` and
+   caches are session-local, while model/database singletons are lazy and cached.
+7. Keep generated model, Ketcher, DuckDB, and notebook output artifacts under `data/` or
+   temporary storage and out of Git.
+
+### Verification map
+
+- `tests/test_runtime.py`: import safety, ONNX patching, secret fallback, callback/HTML
+  alignment, and safe agent reply formatting.
+- `tests/test_chem_utils.py`: primary-product handling, descriptors, byproducts, LC-MS ions,
+  and workup calculations.
+- `tests/test_ord_validator.py`: fingerprints, SMARTS/functional-group gates, ORD parsing,
+  database migration/ingestion, online fallback behavior, Gemini cache scoping, and the
+  integrated search/pipeline state flow. Tests in this file must remain offline.
+
+Run the repository checks from the root:
+
+```sh
+python -m pip install -e '.[test]'
+python -m pytest
+```
+
+When a file, notebook cell, core function, or UI component is added, renamed, moved, or
+deleted, update this human map and the **Repository Structure & Landmarks** section of
+`.github/copilot-instructions.md` in the same change.
