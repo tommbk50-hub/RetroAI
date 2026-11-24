@@ -74,6 +74,7 @@ class StepClassificationItem(BaseModel):
     source_doi_or_patent: str = ""
     typical_conditions: str = ""
     assumed_step_yield: float | None = Field(default=None, ge=0, le=1)
+    scenario_step_yield: float | None = Field(default=None, ge=0.05, le=1)
     cbyd_precedents: List[CbyDPrecedent] = Field(default_factory=list)
     hazard_flags: List[str] = Field(default_factory=list)
     safer_alternatives: List[str] = Field(default_factory=list)

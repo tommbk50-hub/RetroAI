@@ -74,9 +74,20 @@ def _scale_route_eln(route, target_smiles, scale_g, yield_override=None):
         product = _canonical_molecule_smiles(products[0])
         step_positions[step["step_index"]] = len(plans)
         producers[product].append(len(plans))
-        step_yield = override if override is not None else _clamp_step_yield(step.get("assumed_step_yield"))
+        empirical_yield = _clamp_step_yield(step.get("assumed_step_yield"))
+        scenario_yield = _clamp_step_yield(step.get("scenario_step_yield"))
+        step_yield = (
+            override if override is not None
+            else empirical_yield if empirical_yield is not None
+            else scenario_yield
+        )
         if step_yield is None or step_yield <= 0:
             return []
+        yield_basis = (
+            "explicit_scenario" if override is not None
+            else "empirical" if empirical_yield is not None
+            else "scenario"
+        )
         primary_provider = next(iter((step.get("ord_validation") or {}).get("top_precedents") or []), {}).get("provider")
         ingredients = _merge_step_stoichiometry(
             smi,
@@ -89,7 +100,7 @@ def _scale_route_eln(route, target_smiles, scale_g, yield_override=None):
             return []
         plans.append({"step": step, "product": product, "product_mw": Descriptors.MolWt(products[0]),
                       "ingredients": ingredients,
-                      "yield": step_yield})
+                      "yield": step_yield, "yield_basis": yield_basis})
     final_steps = producers.get(_canonical_molecule_smiles(target))
     if not final_steps:
         return []
@@ -162,7 +173,10 @@ def _eln_step_rows(plan):
         mw, mmol, g, mg = amounts(row["mw_g_mol"], plan["limiting_mmol"] * eq)
         rows.append((role, name, mw, load, mmol, g, mg, "—"))
     mw, mmol, g, mg = amounts(plan["product_mw"], plan["product_mmol"])
-    rows.append(("Expected Product", plan["product"], mw, f"{plan['yield']:.0%} yield", mmol, g, mg, "—"))
+    yield_label = f"{plan['yield']:.0%} yield"
+    if plan.get("yield_basis") in {"scenario", "explicit_scenario"}:
+        yield_label += " (unvalidated scenario)"
+    rows.append(("Expected Product", plan["product"], mw, yield_label, mmol, g, mg, "—"))
     return rows
 
 
@@ -176,7 +190,12 @@ def _eln_step_text(plan, *, markdown):
     title = f"Step {step['step_index']}: {text_field(step.get('reaction_name', 'Reaction step'))}"
     if markdown:
         title = f"**{title}**"
-    lines = [f"{title} · {plan['yield']:.0%} assumed yield",
+    yield_text = (
+        f"{plan['yield']:.0%} unvalidated scenario yield"
+        if plan.get("yield_basis") in {"scenario", "explicit_scenario"}
+        else f"{plan['yield']:.0%} empirical yield"
+    )
+    lines = [f"{title} · {yield_text}",
              text_field(step["forward_smiles"]), text_field(step.get("typical_conditions", "")), ""]
     if markdown:
         lines.extend(["| " + " | ".join(_ELN_COLUMNS) + " |", "| " + " | ".join([":---"] * len(_ELN_COLUMNS)) + " |"])
@@ -202,7 +221,12 @@ def _render_eln_step_html(plan, with_heading=True):
     cols = "".join(f"<th>{col}</th>" for col in _ELN_COLUMNS)
     rows = "".join("<tr>" + "".join(f"<td>{html.escape(value)}</td>" for value in row) + "</tr>"
                    for row in _eln_step_rows(plan))
-    return (f"<div>{heading}{plan['yield']:.0%} assumed yield · {plan['limiting_mmol']:.3f} mmol limiting charge</div>"
+    yield_text = (
+        f"{plan['yield']:.0%} unvalidated scenario yield"
+        if plan.get("yield_basis") in {"scenario", "explicit_scenario"}
+        else f"{plan['yield']:.0%} empirical yield"
+    )
+    return (f"<div>{heading}{yield_text} · {plan['limiting_mmol']:.3f} mmol limiting charge</div>"
             f"<div style='overflow-x:auto;'><table class='cf-eln-table'><thead><tr>{cols}</tr></thead><tbody>{rows}</tbody></table></div>"
             "<small>Unreported reactant charges default to 1 eq for planning. Verify analog loadings and unknown amounts before use.</small>")
 
@@ -634,6 +658,7 @@ def _render_routes_html_from_results(res: dict, ord_validator: ORDRetrosynthesis
 
     ram_now = get_process_ram_mb()
     ord_cnt = ord_validator.get_index_size()
+    cbyd_cnt = getattr(ord_validator, "get_cbyd_index_size", lambda: 0)()
     pf = res.get("ord_prefetch_stats") or {}
     pf_added = int(pf.get("added_records", 0))
     pf_steps = int(pf.get("queried_steps", 0))
@@ -653,7 +678,7 @@ def _render_routes_html_from_results(res: dict, ord_validator: ORDRetrosynthesis
     header_html = f"""
     <div class="cf-strat-box">
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">
-        <div style="font-size:10px;font-weight:700;color:#0284c7;">TARGET · {html.escape(str(res.get('search_algorithm', 'RETROSTAR')).upper())} · MODE: {html.escape(rk_mode.upper())} ({len(routes)} ROUTES) · ORD INDEX: {ord_cnt:,} RXNS{pf_pill_html} · AI: {html.escape(used_model.upper())} ({html.escape(used_think.upper())}) · RAM: {ram_now} MB</div>
+        <div style="font-size:10px;font-weight:700;color:#0284c7;">TARGET · {html.escape(str(res.get('search_algorithm', 'RETROSTAR')).upper())} · MODE: {html.escape(rk_mode.upper())} ({len(routes)} ROUTES) · ORD INDEX: {ord_cnt:,} RXNS · CBYD INDEX: {cbyd_cnt:,} RXNS{pf_pill_html} · AI: {html.escape(used_model.upper())} ({html.escape(used_think.upper())}) · RAM: {ram_now} MB</div>
         <button class="cf-btn" style="padding:3px 9px;font-size:11px;" onclick="cfOpenAgentWithRoutes()">🤖 Discuss Routes in Chemist AI Agent</button>
       </div>
       <div style="font-size:13px;font-weight:600;margin:4px 0 6px 0;word-break:break-all;color:#0f172a;">{html.escape(strat.get('iupac_or_label', target))}</div>
@@ -673,6 +698,7 @@ def _render_workbench(ord_validator: ORDRetrosynthesisValidator):
     default_smi = "Cc1cn(-c2cc(NC(=O)c3ccc(C)c(Nc4nccc(-c5cccnc5)n4)c3)cc(C(F)(F)F)c2)cn1"
     init_ram_mb = get_process_ram_mb()
     init_ord_cnt = ord_validator.get_index_size()
+    init_cbyd_cnt = getattr(ord_validator, "get_cbyd_index_size", lambda: 0)()
     catalog_json = json.dumps(GEMINI_MODEL_CATALOG)
     model_options_html = "".join(
         f'<option value="{m_id}" {"selected" if m_id == "gemini-3.8-flash" else ""}>{html.escape(spec["label"])}</option>'
@@ -970,7 +996,7 @@ def _render_workbench(ord_validator: ORDRetrosynthesisValidator):
     <div class="cf-sec-hdr">
       <span>02 · CONFIGURE, ONLINE ORD VALIDATION &amp; AI AGENT</span>
       <span style="display:flex;align-items:center;gap:6px;">
-        <span id="cf-ord-badge" style="font-size:10px;background:#ccfbf1;color:#0f766e;padding:2px 7px;border-radius:10px;font-weight:700;">ORD Index: {init_ord_cnt} rxns</span>
+        <span id="cf-ord-badge" style="font-size:10px;background:#ccfbf1;color:#0f766e;padding:2px 7px;border-radius:10px;font-weight:700;">ORD: {init_ord_cnt} · CbyD: {init_cbyd_cnt} rxns</span>
         <span id="cf-ram-badge" style="font-size:10px;background:#e0f2fe;color:#0369a1;padding:2px 7px;border-radius:10px;font-weight:700;">RAM: {init_ram_mb} MB</span>
         <button class="cf-chip" style="padding:2px 7px;font-size:10px;" onclick="cfFreeMemory()" title="Purge search tree, trim C++ heap &amp; run GC">🧹 Free RAM</button>
       </span>
@@ -1074,7 +1100,7 @@ def _render_workbench(ord_validator: ORDRetrosynthesisValidator):
           <div class="cf-cfg-item">
             <label>ORD Parquet Shards (`ord-data` HF)</label>
             <div style="display:flex;gap:4px;align-items:center;">
-              <button id="cf-ord-sync-btn" class="cf-btn" style="padding:4px 8px;font-size:10.5px;width:100%;" onclick="cfSyncOrdShards(1)" title="Stream &amp; index an ORD .parquet shard from Hugging Face into /dev/shm DuckDB">📥 Sync +1 HF ORD Parquet Shard</button>
+              <button id="cf-ord-sync-btn" class="cf-btn" style="padding:4px 8px;font-size:10.5px;width:100%;" onclick="cfSyncOrdShards(1)" title="Stream &amp; index an ORD protobuf or Parquet shard from Hugging Face into local data/ DuckDB">📥 Sync +1 HF ORD Shard</button>
             </div>
           </div>
           <div class="cf-cfg-item" style="display:flex;flex-direction:column;justify-content:center;gap:4px;">
@@ -1231,22 +1257,22 @@ function cfUpdateRamBadge(ramMb) {{
   if (el) el.innerText = `RAM: ${{ramMb}} MB`;
 }}
 
-function cfUpdateOrdBadge(ordCount, prefetch) {{
-  if (!ordCount) return;
+function cfUpdateOrdBadge(ordCount, prefetch, cbydCount = 0) {{
+  if (ordCount === undefined || ordCount === null) return;
   const el = document.getElementById("cf-ord-badge");
   const statusEl = document.getElementById("cf-status");
   if (prefetch && prefetch.queried_steps > 0) {{
     const addCnt = prefetch.added_records || 0;
     const sec = Number(prefetch.elapsed_sec || 0).toFixed(2);
     if (el) {{
-      el.innerText = `ORD Index: ${{ordCount}} rxns (+${{addCnt}} live · ${{sec}}s)`;
-      el.title = `Queried ${{prefetch.queried_steps}} unique steps against live open-reaction-database.org API in ${{sec}}s`;
+      el.innerText = `ORD: ${{ordCount}} · CbyD: ${{cbydCount}} rxns (+${{addCnt}} indexed · ${{sec}}s)`;
+      el.title = `Queried ${{prefetch.queried_steps}} unique steps; ${{prefetch.api_failures || 0}} API failures, ${{prefetch.parse_drops || 0}} parse drops`;
     }}
     if (statusEl) {{
-      statusEl.innerText = `🌐 +${{addCnt}} live ORD hits (${{prefetch.queried_steps}} steps in ${{sec}}s)`;
+      statusEl.innerText = `🌐 +${{addCnt}} ORD records (${{prefetch.queried_steps}} steps, ${{prefetch.api_failures || 0}} API failures, ${{prefetch.parse_drops || 0}} parse drops)`;
     }}
   }} else {{
-    if (el) el.innerText = `ORD Index: ${{ordCount}} rxns`;
+    if (el) el.innerText = `ORD: ${{ordCount}} · CbyD: ${{cbydCount}} rxns`;
   }}
 }}
 
@@ -1254,12 +1280,12 @@ async function cfSyncOrdShards(nShards) {{
   const btn = document.getElementById("cf-ord-sync-btn");
   if (btn) {{
     btn.disabled = true;
-    btn.innerText = "⏳ Streaming HF Parquet Shard...";
+    btn.innerText = "⏳ Streaming HF ORD Shard...";
   }}
   try {{
     const res = await google.colab.kernel.invokeFunction("chemforge.sync_ord_shards", [nShards || 1], {{}});
     const data = res.data["application/json"];
-    cfUpdateOrdBadge(data.indexed_count);
+    cfUpdateOrdBadge(data.indexed_count, null, data.cbyd_indexed_count || 0);
     cfUpdateRamBadge(data.ram_mb);
     if (btn) {{
       btn.innerText = data.error ? "⚠️ Sync Error (Retry)" : `✅ Indexed (${{data.indexed_count}} rxns) · +1 Shard`;
@@ -1416,12 +1442,12 @@ async function cfRefreshAgentStatus() {{
   const res = await google.colab.kernel.invokeFunction("chemforge.agent_status", [], {{}});
   const d = res.data["application/json"];
   cfUpdateRamBadge(d.ram_mb);
-  cfUpdateOrdBadge(d.ord_index_size);
+  cfUpdateOrdBadge(d.ord_index_size, null, d.cbyd_index_size || 0);
   const bar = document.getElementById("cf-agent-ctx-bar");
   if (bar) {{
     bar.innerText = d.route_count > 0
       ? `✅ Active Session: ${{d.route_count}} ORD-validated routes (${{d.ranking_mode}}) · Model: ${{d.model}} (${{d.thinking_level}}) | Target: ${{d.target_smiles.slice(0, 30)}}...`
-      : `🤖 Active Model: ${{d.model}} (${{d.thinking_level}}) | ORD Index: ${{d.ord_index_size}} rxns | Target: ${{d.target_smiles.slice(0, 30)}}`;
+      : `🤖 Active Model: ${{d.model}} (${{d.thinking_level}}) | ORD: ${{d.ord_index_size}} · CbyD: ${{d.cbyd_index_size || 0}} rxns | Target: ${{d.target_smiles.slice(0, 30)}}`;
   }}
 }}
 
@@ -1499,7 +1525,7 @@ async function cfRunSynthesis() {{
     const data = res.data["application/json"];
     out.innerHTML = data.error ? `<div style="color:#dc2626;font-weight:600;">⚠️ ${{cfEscapeHtml(data.error)}}</div>` : data.html;
     cfUpdateRamBadge(data.ram_mb);
-    cfUpdateOrdBadge(data.ord_index_size, data.ord_prefetch);
+    cfUpdateOrdBadge(data.ord_index_size, data.ord_prefetch, data.cbyd_index_size || 0);
     cfRefreshAgentStatus();
   }} catch (err) {{
     clearInterval(progTimer);
@@ -1541,7 +1567,7 @@ async function cfReclassifyRoutes() {{
       out.innerHTML = data.html;
     }}
     cfUpdateRamBadge(data.ram_mb);
-    cfUpdateOrdBadge(data.ord_index_size, data.ord_prefetch);
+    cfUpdateOrdBadge(data.ord_index_size, data.ord_prefetch, data.cbyd_index_size || 0);
     cfRefreshAgentStatus();
   }} catch (err) {{
     const banner = document.getElementById("cf-reclass-banner");
@@ -1787,10 +1813,12 @@ class _Workbench:
 
 
     def _cb_sync_ord_shards(self, num_shards: int = 1):
-        """Streams ORD protobuf shards from Hugging Face into the DuckDB index and updates UI badge."""
+        """Streams ORD protobuf/Parquet shards into the active DuckDB index and updates UI."""
+        getattr(self.ord_validator, "refresh_index", lambda: None)()
         info = self.ord_validator.sync_huggingface_parquet_shards(
             max_shards=int(num_shards), route_steps=self.state.active_route_steps()
         )
+        info["cbyd_indexed_count"] = getattr(self.ord_validator, "get_cbyd_index_size", lambda: 0)()
         info["ram_mb"] = get_process_ram_mb()
         return IPython.display.JSON(info)
 
@@ -1920,6 +1948,7 @@ class _Workbench:
             "route_count": len(routes),
             "target_smiles": res.get("target_smiles", target),
             "ord_index_size": self.ord_validator.get_index_size(),
+            "cbyd_index_size": getattr(self.ord_validator, "get_cbyd_index_size", lambda: 0)(),
             "ord_prefetch": res.get("ord_prefetch_stats", {}),
             "ram_mb": ram_mb,
         })
@@ -2022,6 +2051,7 @@ class _Workbench:
             "route_count": len(routes),
             "target_smiles": res.get("target_smiles", ""),
             "ord_index_size": self.ord_validator.get_index_size(),
+            "cbyd_index_size": getattr(self.ord_validator, "get_cbyd_index_size", lambda: 0)(),
             "ord_prefetch": ord_prefetch,
             "ram_mb": ram_mb,
         })
@@ -2151,6 +2181,7 @@ class _Workbench:
             "model": ACTIVE_GENAI_SETTINGS.get("model", "gemini-3.8-flash"),
             "thinking_level": ACTIVE_GENAI_SETTINGS.get("thinking_level", "medium"),
             "ord_index_size": self.ord_validator.get_index_size(),
+            "cbyd_index_size": getattr(self.ord_validator, "get_cbyd_index_size", lambda: 0)(),
             "ram_mb": ram_mb,
         })
 

@@ -56,6 +56,9 @@ and supplied with `--route-tree-jsonl data/cbyd/data/route_tree.jsonl` so RetroA
 indexes reactions reachable in the generated tree. By default, RetroAI writes the
 `cbyd_reactions` and `cbyd_metadata` tables beside `ord_reactions` in its local DuckDB
 database. CbyD is wholly optional: absent tables degrade to the existing ORD-only flow.
+If `data/cbyd/data/routes` is already present, notebook Cell 1 ingests release
+`v2026.11` automatically into the same `data/ord_precedents.duckdb` database. The
+workbench header reports ORD and CbyD counts independently.
 Ingested DOI, citation, mapping-confidence, parsed yield, chemoselectivity, and hazard
 metadata remain available to the Chemist AI Agent and Reaction tab.
 The Synthesis settings enable a common lab-reagent allowlist by default for reagents that
@@ -144,17 +147,17 @@ Colab callback behavior belongs in `ui`.
 | `retroai/core/resolver.py` | Chemical identifier resolution | `_resolve_chemical_identifier()` handles direct structures plus explicit network lookups for external identifiers. |
 | `retroai/engine/aizynth.py` | AiZynthFinder lifecycle, templates, stock, and cleanup | `get_finder()`, `_harvest_uspto_templates_from_finder()`, `_flatten_reaction_tree()`, `cleanup_aizynth_memory()`, and `register_custom_lab_stock()`. Finder loading remains lazy and requires `data/config.yml`. |
 | `retroai/engine/pipeline.py` | End-to-end route search and route-level scoring | `run_retrosynthesis_pipeline()`, `compute_composite_route_score()`, and result compaction. This is the orchestration seam between search, classification, ORD evidence, stock, and state. |
-| `retroai/ord/fingerprints.py` | Reaction fingerprints and chemical matching | Packed RDKit/DRFP fingerprints, functional-group deltas, progressive SMARTS tiers, MCS reaction centers, gate decisions, and online-search core extraction. Add chemistry-admission rules here, not in the UI. |
+| `retroai/ord/fingerprints.py` | Reaction fingerprints and chemical matching | Packed RDKit/DRFP fingerprints, functional-group deltas, medicinal-chemistry family classification, progressive semantic/MCS SMARTS tiers, gate decisions, and compact online-search core extraction. Add chemistry-admission rules here, not in the UI. |
 | `retroai/ord/parser.py` | ORD protobuf-to-record normalization | `parse_ord_reaction_protobuf()` desalts and canonicalizes species, classifies spectators, extracts yield/conditions/provenance, normalizes stoichiometry, and precomputes indexed features. Its output is a DuckDB row contract. |
-| `retroai/ord/validator.py` | ORD persistence, ingestion, retrieval, and route confidence | `ORDRetrosynthesisValidator`, database migration/backfill, in-memory DRFP index, online/Hugging Face ingestion, `validate_step()`, and `score_route()`. Construction may create a database; imports must not. |
+| `retroai/ord/validator.py` | ORD persistence, ingestion, retrieval, and route confidence | `ORDRetrosynthesisValidator`, database migration/backfill, refreshable dual ORD/CbyD in-memory indexes, online/protobuf/Parquet ingestion diagnostics, `validate_step()`, and `score_route()`. Construction may create `data/ord_precedents.duckdb`; imports must not. |
 | `retroai/cbyd/parser.py` | CbyD normalization and condition parsing | CbyD step validation, canonical/desalted deduplication, structured yield/condition fields, spectator survival tags, and deterministic hazard flags. |
 | `retroai/cbyd/ingest.py` | Optional CbyD DuckDB ingestion | CLI/function for route JSON ingestion, mapping-confidence/route-tree filtering, deduplication, `cbyd_reactions`, and release metadata. |
 | `retroai/cbyd/advisor.py` | Stereochemical controls and CbyD alternatives | Flags uncontrolled creation/inversion, queries annotated stereoselective precedents, and exposes a curated chiral-pool/auxiliary catalog. |
 | `retroai/ai/gemini_client.py` | Gemini client/configuration and fallback calls | `get_gemini_client()`, `_build_genai_config()`, and `call_gemini_with_config()`. Keep model selection and retry behavior here. |
-| `retroai/ai/classifier.py` | Step-level RDKit/ORD/Gemini enrichment | `rdkit_classify_step()`, `batch_classify_with_gemini()`, `_classify_route_steps()`, condition ranking, stoichiometry transfer, evidence context, and the per-state enrichment cache. RDKit/ORD baseline must remain usable without Gemini. |
+| `retroai/ai/classifier.py` | Step-level RDKit/ORD/Gemini enrichment | `rdkit_classify_step()`, `batch_classify_with_gemini()`, `_classify_route_steps()`, concrete family-specific unvalidated baselines, condition ranking, stoichiometry transfer, evidence context, and the per-state enrichment cache. RDKit/ORD baseline must remain usable without Gemini. |
 | `retroai/ai/literature.py` | DOI and literature verification | Crossref identity checks and Europe PMC/PubMed candidate discovery. Network access happens only when these functions are called. |
 | `retroai/ui/ketcher.py` | Ketcher asset delivery | `_ensure_ketcher_bundle()` downloads/caches the pinned bundle, serves auxiliary assets on loopback, and inlines the main document assets. |
-| `retroai/ui/workbench.py` | Colab UI, callbacks, HTML rendering, ELN scaling, and agent tools | `launch_workbench()`, `_Workbench`, route/step renderers, callback names, scaled stoichiometry, and the embedded workbench frontend. Changes to a callback must update both the HTML caller and `output.register_callback`. |
+| `retroai/ui/workbench.py` | Colab UI, callbacks, HTML rendering, ELN scaling, and agent tools | `launch_workbench()`, `_Workbench`, ORD/CbyD telemetry, route/step renderers, callback names, empirical-or-explicit-scenario scaled stoichiometry, and the embedded workbench frontend. Changes to a callback must update both the HTML caller and `output.register_callback`. |
 | `retroai/{ai,core,engine,ord,ui}/__init__.py` | Package markers | Currently intentionally empty. Do not use them for database, network, model, or Colab initialization. |
 
 ### Core data contracts
@@ -176,7 +179,9 @@ Colab callback behavior belongs in `ui`.
 - `cbyd.ingest` defines the separate `cbyd_reactions` row contract. Keep ingestion offline
   and optional; an absent CbyD table must never block validator construction or ORD search.
 - Pydantic models in `core/schemas.py` define Gemini's JSON contract. If a step field is added,
-  update the schema first, then classification/rendering consumers.
+  update the schema first, then classification/rendering consumers. `scenario_step_yield` is
+  planning-only and must remain separate from `assumed_step_yield`, which represents empirical
+  evidence.
 - `_render_routes_html_from_results()` renders SVG and HTML on demand. Store compact JSON-like
   route data in state; do not reintroduce reaction trees, RDKit objects, or large SVG blobs.
 
@@ -207,7 +212,8 @@ Colab callback behavior belongs in `ui`.
    RDKit/DuckDB work on the coordinating thread, as enforced by
    `ORDRetrosynthesisValidator.batch_prefetch_online_ord()`.
 4. Keep "no gated precedent" distinct from low-yield precedent evidence. Unvalidated steps
-   must not acquire a synthetic empirical yield or success-shaped ORD data.
+   must not acquire a synthetic empirical yield or success-shaped ORD data. They may carry a
+   separately labeled scenario yield for scaled planning, never for evidence scoring.
 5. Gemini output is enrichment, not the evidence authority. Step responses must pass Pydantic
    validation and citation checks in `ai/classifier.py`; an unavailable client falls back to
    the RDKit/ORD baseline.
@@ -226,8 +232,9 @@ Colab callback behavior belongs in `ui`.
 - `tests/test_chem_utils.py`: primary-product handling, descriptors, byproducts, LC-MS ions,
   and workup calculations.
 - `tests/test_ord_validator.py`: fingerprints, SMARTS/functional-group gates, ORD parsing,
-  database migration/ingestion, online fallback behavior, Gemini cache scoping, and the
-  integrated search/pipeline state flow. Tests in this file must remain offline.
+  database migration/protobuf/Parquet ingestion, online fallback and parse/index diagnostics,
+  unvalidated baselines, Gemini citation sanitization, ELN scenario scaling, Gemini cache
+  scoping, and the integrated search/pipeline state flow. Tests in this file must remain offline.
 - `tests/test_cbyd.py`: offline CbyD parsing, deduplication, migration/schema, fallback
   retrieval, multi-step yield handling, provenance, and hazard guardrails.
 - `tests/test_cbyd_integration.py`: self-contained CbyD route-tree/schema, complexity,

@@ -118,7 +118,7 @@ def _harvest_uspto_templates_from_finder(finder_obj, node_templates=None, *, sta
             if not forward_smiles:
                 continue
             meta = node.metadata or {}
-            code = meta.get("template_code")
+            code = meta.get("template_code", meta.get("template_hash"))
             retro = text(meta.get("retro_template")) or text(meta.get("template"))
             classification = text(meta.get("classification"))
             if templates is not None and code is not None and (not retro or not classification):
@@ -129,8 +129,14 @@ def _harvest_uspto_templates_from_finder(finder_obj, node_templates=None, *, sta
                         row = templates.loc[int(code)]
                     except (KeyError, TypeError, ValueError, OverflowError):
                         row = {}
-                retro = retro or text(row.get(template_column))
-                classification = classification or text(row.get("classification"))
+                for column in (template_column, "retro_template", "template", "reaction_smarts"):
+                    if retro:
+                        break
+                    retro = text(row.get(column))
+                for column in ("classification", "reaction_class", "class"):
+                    if classification:
+                        break
+                    classification = text(row.get(column))
             entry = {
                 "retro_template": retro,
                 "classification": classification,
@@ -142,6 +148,7 @@ def _harvest_uspto_templates_from_finder(finder_obj, node_templates=None, *, sta
                 entry["mapped_forward_smiles"] = mapped
             if node_templates is not None:
                 node_templates[id(node)] = entry
+                node_templates[forward_smiles] = entry
             if forward_smiles not in registry or (entry["retro_template"] and not registry[forward_smiles]["retro_template"]):
                 registry[forward_smiles] = entry
     state.step_templates.clear()
@@ -158,7 +165,8 @@ def _flatten_reaction_tree(rxn_tree, node_templates):
         forward = _reverse_reaction(node.reaction_smiles())
         if not forward:
             return []
-        steps.append(dict(node_templates.get(id(node), {}), forward_smiles=forward, step_index=indices[id(node)],
+        entry = node_templates.get(id(node), node_templates.get(forward, {}))
+        steps.append(dict(entry, forward_smiles=forward, step_index=indices[id(node)],
                           precursor_steps=[indices[id(child)] for child in rxn_tree.child_reactions(node)]))
     return steps
 
