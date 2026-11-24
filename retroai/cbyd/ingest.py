@@ -165,19 +165,26 @@ def ingest_cbyd_routes(
                 continue
             records[key] = parsed
 
+    # Deduplicate reaction IDs here (last record wins) so the load can use plain
+    # INSERTs: per-row INSERT OR REPLACE inside a transaction pins ~1 MiB of DuckDB
+    # memory per statement and exhausts runner RAM on full CbyD releases.
+    rows_by_id = {
+        record["reaction_id"]: [record[name] for name in CBYD_SCHEMA]
+        for record in records.values()
+    }
+
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with duckdb.connect(str(db_path)) as con:
         ensure_cbyd_schema(con)
         con.execute("BEGIN")
         try:
             con.execute("DELETE FROM cbyd_reactions")
-            for record in records.values():
-                values = [record[name] for name in CBYD_SCHEMA]
-                placeholders = ",".join("?" for _ in CBYD_SCHEMA)
+            if rows_by_id:
                 columns = ",".join(CBYD_SCHEMA)
-                con.execute(
-                    f"INSERT OR REPLACE INTO cbyd_reactions ({columns}) VALUES ({placeholders})",
-                    values,
+                placeholders = ",".join("?" for _ in CBYD_SCHEMA)
+                con.executemany(
+                    f"INSERT INTO cbyd_reactions ({columns}) VALUES ({placeholders})",
+                    list(rows_by_id.values()),
                 )
             if release_version:
                 con.execute(

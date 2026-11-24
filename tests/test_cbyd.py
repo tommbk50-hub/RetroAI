@@ -118,6 +118,48 @@ def test_cbyd_ingestion_deduplicates_filters_and_records_metadata(tmp_path):
         ).fetchall() == [("replacement", "v2026.12")]
 
 
+def test_cbyd_ingestion_fits_small_duckdb_memory_limit(tmp_path, monkeypatch):
+    routes = tmp_path / "routes"
+    routes.mkdir()
+    for length in range(1, 81):
+        chain = "C" * length
+        mapped = f"{chain}[CH2:1][OH:2]>>{chain}[CH:1]=[O:2]"
+        (routes / f"r{length}.json").write_text(
+            json.dumps(_route(f"r{length}", mapped=mapped)), encoding="utf-8"
+        )
+    connect = duckdb.connect
+    monkeypatch.setattr(
+        duckdb,
+        "connect",
+        lambda database, *args, **kwargs: connect(
+            database, config={"memory_limit": "64MB"}
+        ),
+    )
+
+    result = ingest_cbyd_routes(routes, tmp_path / "limited.duckdb")
+
+    assert result["parsed"] == result["indexed"] == 80
+
+
+def test_cbyd_ingestion_keeps_last_duplicate_reaction_id_and_reingests(tmp_path):
+    routes = tmp_path / "routes"
+    routes.mkdir()
+    (routes / "a.json").write_text(json.dumps(_route("shared")), encoding="utf-8")
+    (routes / "b.json").write_text(
+        json.dumps(_route("shared", mapped="CCCO>>CCC=O")), encoding="utf-8"
+    )
+    db_path = tmp_path / "dupes.duckdb"
+
+    for release in ("v2026.11", "v2026.12"):
+        result = ingest_cbyd_routes(routes, db_path, release_version=release)
+        assert result["parsed"] == 2
+        assert result["indexed"] == 1
+        with duckdb.connect(str(db_path)) as con:
+            assert con.execute(
+                "SELECT reaction_id, route_file, release_version FROM cbyd_reactions"
+            ).fetchall() == [("shared", "b.json", release)]
+
+
 def test_ingestion_uses_route_tree_reachability_and_rejects_bad_jsonl(tmp_path):
     routes = tmp_path / "routes"
     routes.mkdir()
