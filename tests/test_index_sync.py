@@ -236,6 +236,31 @@ def test_atomic_sync_merges_cbyd_without_clobbering_ord(
     assert second["status"] == "current"
     assert not second["installed"]
 
+    ingest_cbyd_routes(
+        tmp_path / "routes",
+        db_path,
+        release_version="v-test",
+    )
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        assert con.execute(
+            "SELECT count(*) FROM cbyd_metadata "
+            "WHERE key = 'prebuilt_sha256'"
+        ).fetchone()[0] == 0
+
+
+def test_validator_ignores_incompatible_cbyd_schema(tmp_path):
+    validator = ORDRetrosynthesisValidator(tmp_path / "precedents.duckdb")
+    with duckdb.connect(str(validator.db_path)) as con:
+        con.execute("CREATE TABLE cbyd_reactions (reaction_id VARCHAR)")
+        con.execute("CREATE TABLE cbyd_metadata (key VARCHAR, value VARCHAR)")
+        con.execute(
+            "INSERT INTO cbyd_metadata VALUES "
+            "('index_schema_version', '999')"
+        )
+    validator.refresh_index()
+    assert validator.get_cbyd_index_size() == 0
+    assert validator.validate_step(OXIDATION)["cbyd_matched_count"] == 0
+
 
 @pytest.mark.parametrize("network_failure", ["http", "connection"])
 def test_best_effort_sync_gracefully_falls_back(

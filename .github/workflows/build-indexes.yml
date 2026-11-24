@@ -54,18 +54,50 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --pattern manifest.json \
               --dir "$RUNNER_TEMP/published-index" >/dev/null 2>&1; then
-            current_release="$(
-              python -c 'import json,sys; print(json.load(open(sys.argv[1])).get("cbyd", {}).get("release", ""))' \
-                "$RUNNER_TEMP/published-index/manifest.json"
-            )"
-            current_schema="$(
-              python -c 'import json,sys; print(json.load(open(sys.argv[1])).get("index_schema_version", ""))' \
-                "$RUNNER_TEMP/published-index/manifest.json"
-            )"
+            readarray -t published < <(
+              python -c '
+                import json, os
+                from pathlib import Path
+                from retroai.ord.index_sync import validate_index_manifest
+                manifest = validate_index_manifest(json.loads(Path(os.environ["RUNNER_TEMP"], "published-index", "manifest.json").read_text(encoding="utf-8")))
+                print(manifest["cbyd"]["release"])
+                print(manifest["index_schema_version"])
+                print(manifest["cbyd"]["file"])
+                print(manifest["cbyd"]["sha256"])
+              '
+            ) || true
+            if [[ ${#published[@]} -eq 4 ]]; then
+              current_release="${published[0]}"
+              current_schema="${published[1]}"
+              current_file="${published[2]}"
+              current_sha256="${published[3]}"
+              if gh release download "$ROLLING_RELEASE" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --pattern "$current_file" \
+                  --dir "$RUNNER_TEMP/published-index" >/dev/null 2>&1 \
+                && printf '%s  %s\n' "$current_sha256" \
+                    "$RUNNER_TEMP/published-index/$current_file" | sha256sum --check --status \
+                  && CURRENT_FILE="$RUNNER_TEMP/published-index/$current_file" \
+                     CURRENT_MANIFEST="$RUNNER_TEMP/published-index/manifest.json" \
+                     python -c '
+                       import json, os
+                       from pathlib import Path
+                       from retroai.ord.index_sync import _validate_prebuilt_index
+                       _validate_prebuilt_index(Path(os.environ["CURRENT_FILE"]), json.loads(Path(os.environ["CURRENT_MANIFEST"]).read_text(encoding="utf-8")))
+                     ' >/dev/null
+              then
+                publication_valid=true
+              else
+                publication_valid=false
+              fi
+            else
+              publication_valid=false
+            fi
           fi
 
           should_build=true
           if [[ "$FORCE_REBUILD" != "true" \
+                && "${publication_valid:-false}" == "true" \
                 && "$current_release" == "$cbyd_release" \
                 && "$current_schema" == "$schema_version" ]]; then
             should_build=false
@@ -185,6 +217,12 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 
+          assets="$(
+            gh release view "$ROLLING_RELEASE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name'
+          )"
           while IFS= read -r old_asset; do
             if [[ "$old_asset" == cbyd_*.duckdb \
                   && "$old_asset" != "$CBYD_INDEX_NAME" ]]; then
@@ -192,9 +230,4 @@ jobs:
                 --repo "$GITHUB_REPOSITORY" \
                 --yes
             fi
-          done < <(
-            gh release view "$ROLLING_RELEASE" \
-              --repo "$GITHUB_REPOSITORY" \
-              --json assets \
-              --jq '.assets[].name'
-          )
+          done <<< "$assets"

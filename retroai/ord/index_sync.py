@@ -132,8 +132,8 @@ def validate_index_manifest(manifest: dict) -> dict:
         raise IndexSyncError("Prebuilt index manifest contains an invalid CbyD row count.") from exc
     if rows <= 0:
         raise IndexSyncError("Prebuilt CbyD index is unexpectedly empty.")
-    if not isinstance(cbyd.get("license"), str) or not cbyd["license"].strip():
-        raise IndexSyncError("Prebuilt index manifest has no CbyD license.")
+    if cbyd.get("license") != "CC-BY-4.0":
+        raise IndexSyncError("Prebuilt index manifest has an unexpected CbyD license.")
     if not isinstance(cbyd.get("duckdb_version"), str) or not re.match(
         r"^\d+\.\d+", cbyd["duckdb_version"]
     ):
@@ -214,6 +214,8 @@ def _validate_prebuilt_index(path: Path, manifest: dict) -> None:
         )
     if expected.get("release") and metadata.get("release_version") != expected["release"]:
         raise IndexSyncError("Prebuilt CbyD release metadata does not match the manifest.")
+    if metadata.get("source_license") != "CC BY 4.0":
+        raise IndexSyncError("Prebuilt CbyD database has an unexpected source license.")
     producer_version = expected.get("duckdb_version") or metadata.get("duckdb_version")
     if producer_version and _duckdb_series(producer_version) != _duckdb_series(duckdb.__version__):
         raise IndexSyncError(

@@ -197,6 +197,9 @@ def ingest_cbyd_routes(
                 "('duckdb_version', ?)",
                 [duckdb.__version__],
             )
+            con.execute(
+                "DELETE FROM cbyd_metadata WHERE key = 'prebuilt_sha256'"
+            )
             con.execute("COMMIT")
         except Exception:
             con.execute("ROLLBACK")
