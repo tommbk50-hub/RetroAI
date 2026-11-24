@@ -1,0 +1,233 @@
+name: Build precomputed reaction indexes
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: Rebuild even when the published release and schema are current
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-reaction-indexes
+  cancel-in-progress: false
+
+jobs:
+  build-cbyd-index:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ROLLING_RELEASE: indexes-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install RetroAI index builder
+        run: python -m pip install -e .
+
+      - name: Check upstream release and published schema
+        id: check
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild || false }}
+        run: |
+          set -euo pipefail
+          cbyd_release="$(
+            gh api repos/chemistry-by-design/cbyd/releases/latest --jq .tag_name
+          )"
+          schema_version="$(
+            python -c 'from retroai.ord.index_sync import INDEX_SCHEMA_VERSION; print(INDEX_SCHEMA_VERSION)'
+          )"
+          current_release=""
+          current_schema=""
+          rm -rf "$RUNNER_TEMP/published-index"
+          if gh release download "$ROLLING_RELEASE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern manifest.json \
+              --dir "$RUNNER_TEMP/published-index" >/dev/null 2>&1; then
+            readarray -t published < <(
+              python -c '
+                import json, os
+                from pathlib import Path
+                from retroai.ord.index_sync import validate_index_manifest
+                manifest = validate_index_manifest(json.loads(Path(os.environ["RUNNER_TEMP"], "published-index", "manifest.json").read_text(encoding="utf-8")))
+                print(manifest["cbyd"]["release"])
+                print(manifest["index_schema_version"])
+                print(manifest["cbyd"]["file"])
+                print(manifest["cbyd"]["sha256"])
+              '
+            ) || true
+            if [[ ${#published[@]} -eq 4 ]]; then
+              current_release="${published[0]}"
+              current_schema="${published[1]}"
+              current_file="${published[2]}"
+              current_sha256="${published[3]}"
+              if gh release download "$ROLLING_RELEASE" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --pattern "$current_file" \
+                  --dir "$RUNNER_TEMP/published-index" >/dev/null 2>&1 \
+                && printf '%s  %s\n' "$current_sha256" \
+                    "$RUNNER_TEMP/published-index/$current_file" | sha256sum --check --status \
+                  && CURRENT_FILE="$RUNNER_TEMP/published-index/$current_file" \
+                     CURRENT_MANIFEST="$RUNNER_TEMP/published-index/manifest.json" \
+                     python -c '
+                       import json, os
+                       from pathlib import Path
+                       from retroai.ord.index_sync import _validate_prebuilt_index
+                       _validate_prebuilt_index(Path(os.environ["CURRENT_FILE"]), json.loads(Path(os.environ["CURRENT_MANIFEST"]).read_text(encoding="utf-8")))
+                     ' >/dev/null
+              then
+                publication_valid=true
+              else
+                publication_valid=false
+              fi
+            else
+              publication_valid=false
+            fi
+          fi
+
+          should_build=true
+          if [[ "$FORCE_REBUILD" != "true" \
+                && "${publication_valid:-false}" == "true" \
+                && "$current_release" == "$cbyd_release" \
+                && "$current_schema" == "$schema_version" ]]; then
+            should_build=false
+          fi
+          echo "cbyd_release=$cbyd_release" >> "$GITHUB_OUTPUT"
+          echo "schema_version=$schema_version" >> "$GITHUB_OUTPUT"
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "CbyD=$cbyd_release; schema=$schema_version; build=$should_build"
+
+      - name: Skip current index
+        if: steps.check.outputs.should_build != 'true'
+        run: echo "Published CbyD index already matches the upstream release and local schema."
+
+      - name: Clone released CbyD data
+        if: steps.check.outputs.should_build == 'true'
+        env:
+          CBYD_RELEASE: ${{ steps.check.outputs.cbyd_release }}
+        run: |
+          git -c advice.detachedHead=false clone \
+            --depth 1 \
+            --branch "$CBYD_RELEASE" \
+            https://github.com/chemistry-by-design/cbyd.git \
+            "$RUNNER_TEMP/cbyd"
+
+      - name: Build standalone CbyD DuckDB index
+        if: steps.check.outputs.should_build == 'true'
+        env:
+          CBYD_RELEASE: ${{ steps.check.outputs.cbyd_release }}
+        run: |
+          set -euo pipefail
+          safe_release="$(printf '%s' "$CBYD_RELEASE" | tr -c '[:alnum:]._-' '_')"
+          mkdir -p "$RUNNER_TEMP/indexes"
+          index_file="$RUNNER_TEMP/indexes/cbyd_${safe_release}.duckdb"
+          python -u -m retroai.cbyd.ingest \
+            "$RUNNER_TEMP/cbyd/data/routes" \
+            --db "$index_file" \
+            --release "$CBYD_RELEASE"
+          echo "CBYD_INDEX_FILE=$index_file" >> "$GITHUB_ENV"
+          echo "CBYD_INDEX_NAME=$(basename "$index_file")" >> "$GITHUB_ENV"
+
+      - name: Validate index and generate manifest
+        if: steps.check.outputs.should_build == 'true'
+        env:
+          CBYD_RELEASE: ${{ steps.check.outputs.cbyd_release }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import duckdb
+
+          from retroai.ord.index_sync import INDEX_SCHEMA_VERSION, REQUIRED_CBYD_COLUMNS
+
+          path = Path(os.environ["CBYD_INDEX_FILE"])
+          with duckdb.connect(str(path), read_only=True) as con:
+              tables = {
+                  row[0]
+                  for row in con.execute(
+                      "SELECT table_name FROM information_schema.tables"
+                  ).fetchall()
+              }
+              assert {"cbyd_reactions", "cbyd_metadata"} <= tables
+              columns = {row[0] for row in con.execute("DESCRIBE cbyd_reactions").fetchall()}
+              assert REQUIRED_CBYD_COLUMNS <= columns
+              rows = con.execute("SELECT count(*) FROM cbyd_reactions").fetchone()[0]
+              assert rows > 0
+              invalid = con.execute(
+                  """
+                  SELECT count(*) FROM cbyd_reactions
+                  WHERE drfp_bytes IS NULL OR octet_length(drfp_bytes) <> 256
+                  """
+              ).fetchone()[0]
+              assert invalid == 0
+              metadata = dict(
+                  con.execute("SELECT key, value FROM cbyd_metadata").fetchall()
+              )
+              assert metadata["release_version"] == os.environ["CBYD_RELEASE"]
+              assert int(metadata["index_schema_version"]) == INDEX_SCHEMA_VERSION
+              assert metadata["source_license"] == "CC BY 4.0"
+
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          manifest = {
+              "index_schema_version": INDEX_SCHEMA_VERSION,
+              "updated_at": datetime.now(timezone.utc).isoformat(),
+              "cbyd": {
+                  "release": os.environ["CBYD_RELEASE"],
+                  "file": os.environ["CBYD_INDEX_NAME"],
+                  "rows": rows,
+                  "sha256": digest,
+                  "license": "CC-BY-4.0",
+                  "duckdb_version": duckdb.__version__,
+              },
+          }
+          Path(os.environ["RUNNER_TEMP"], "indexes", "manifest.json").write_text(
+              json.dumps(manifest, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Publish rolling release assets
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          if ! gh release view "$ROLLING_RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$ROLLING_RELEASE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "RetroAI precomputed indexes" \
+              --notes "Rolling schema-versioned reaction indexes generated from upstream releases."
+          fi
+          gh release upload "$ROLLING_RELEASE" \
+            "$CBYD_INDEX_FILE" \
+            "$RUNNER_TEMP/indexes/manifest.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+          assets="$(
+            gh release view "$ROLLING_RELEASE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name'
+          )"
+          while IFS= read -r old_asset; do
+            if [[ "$old_asset" == cbyd_*.duckdb \
+                  && "$old_asset" != "$CBYD_INDEX_NAME" ]]; then
+              gh release delete-asset "$ROLLING_RELEASE" "$old_asset" \
+                --repo "$GITHUB_REPOSITORY" \
+                --yes
+            fi
+          done <<< "$assets"

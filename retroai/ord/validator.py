@@ -39,6 +39,7 @@ from .fingerprints import (
     matches_reaction_smarts_mols,
     tanimoto_packed_fp_batch,
 )
+from .index_sync import INDEX_SCHEMA_VERSION
 from .parser import _humanize_condition_list, parse_ord_reaction_protobuf
 
 
@@ -475,7 +476,18 @@ class ORDRetrosynthesisValidator:
             has_cbyd = con.execute(
                 "SELECT count(*) FROM information_schema.tables WHERE table_name = 'cbyd_reactions'"
             ).fetchone()[0] > 0
-            if has_cbyd:
+            has_cbyd_metadata = con.execute(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = 'cbyd_metadata'"
+            ).fetchone()[0] > 0
+            cbyd_schema_version = ""
+            if has_cbyd_metadata:
+                cbyd_schema_version = con.execute(
+                    "SELECT value FROM cbyd_metadata WHERE key = 'index_schema_version'"
+                ).fetchone()
+                cbyd_schema_version = (
+                    cbyd_schema_version[0] if cbyd_schema_version else ""
+                )
+            if has_cbyd and cbyd_schema_version == str(INDEX_SCHEMA_VERSION):
                 self._cbyd_index_size = con.execute("SELECT count(*) FROM cbyd_reactions").fetchone()[0]
                 cbyd_rows = con.execute(
                     "SELECT reaction_id, drfp_bytes FROM cbyd_reactions "
