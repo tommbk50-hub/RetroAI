@@ -7,6 +7,7 @@ from pathlib import Path
 
 import duckdb
 
+from retroai.ord.index_sync import INDEX_SCHEMA_VERSION
 from retroai.ord.validator import ORD_DB_PATH
 
 from .parser import parse_cbyd_step
@@ -185,6 +186,16 @@ def ingest_cbyd_routes(
                 )
             con.execute(
                 "INSERT OR REPLACE INTO cbyd_metadata VALUES ('source_license', 'CC BY 4.0')"
+            )
+            con.execute(
+                "INSERT OR REPLACE INTO cbyd_metadata VALUES "
+                "('index_schema_version', ?)",
+                [str(INDEX_SCHEMA_VERSION)],
+            )
+            con.execute(
+                "INSERT OR REPLACE INTO cbyd_metadata VALUES "
+                "('duckdb_version', ?)",
+                [duckdb.__version__],
             )
             con.execute("COMMIT")
         except Exception:

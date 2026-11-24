@@ -12,17 +12,20 @@
 - `retroai/ord/fingerprints.py`: packed RDKit/DRFP reaction fingerprints, multiplicity-aware functional-group deltas, medicinal-chemistry family classification, progressive semantic/MCS SMARTS gates, and compact reaction-core extraction.
 - `retroai/ord/parser.py`: offline ORD protobuf normalization, salt stripping, spectator classification, and precomputed fingerprint/ΔFG features.
 - `retroai/ord/validator.py`: DuckDB schema migration/backfill, refreshable dual ORD/CbyD DRFP indexes, exact/chemical validation, chemoselective CbyD re-ranking, stereoselective lookup, online diagnostics, and Hugging Face protobuf/Parquet ingestion.
+- `retroai/ord/index_sync.py`: import-safe manifest validation, checksum-verified atomic CbyD index download, and transactional CbyD-only installation into the shared ORD database.
 - `retroai/ai/classifier.py`: offline RDKit family classification, concrete unvalidated condition/stoichiometry baselines, ORD/CbyD enrichment, Gemini citation sanitization, and explicit scenario-yield planning.
 - `retroai/ui/workbench.py`: ORD/CbyD telemetry plus Colab callbacks, route rendering, and empirical/scenario-yield ELN scaling.
 - `retroai/cbyd/advisor.py`: CbyD-backed stereochemical-control risk analysis and curated chiral-pool/auxiliary suggestions.
 - `retroai/cbyd/parser.py`: CbyD step normalization, structured yield/condition parsing, spectator functional groups, and deterministic academic hazard flags.
-- `retroai/cbyd/ingest.py`: offline route JSON filtering/deduplication, `cbyd_reactions` persistence, and CbyD release metadata.
+- `retroai/cbyd/ingest.py`: offline route JSON filtering/deduplication, `cbyd_reactions` persistence, and schema/versioned CbyD release metadata.
+- `.github/workflows/build-indexes.yml`: weekly/manual schema-aware CbyD release indexing and rolling `indexes-latest` asset publication.
 - `tests/test_cbyd.py`: offline CbyD ingestion, provenance, chemoselective fallback, multi-step yield, and hazard coverage.
 - `tests/test_cbyd_integration.py`: CbyD integration, SAScore/SPS key-step, loop, stock, and stereochemical-risk regression tests.
 - `tests/benchmarks/benchmark_cbyd.py`: opt-in native CbyD route-tree recovery, convergence, Lock Selected, and stock-coverage benchmark.
 - `retroai/core/chem_utils.py`: shared primary-molecule extraction, SAScore/SPS complexity metrics, stereochemical change detection, and chemistry analytics used by ORD, engine, and UI callers.
 - `retroai/engine/pipeline.py`: route search/scoring, LLS complexity payloads, strategic key-step tagging, and unproductive-loop penalties.
 - `tests/test_ord_validator.py`: offline ORD pipeline, migration, matching, persistence, and integration coverage; tests must not fetch live data.
+- `tests/test_index_sync.py`: offline manifest, checksum, atomic download, CbyD/ORD merge, fallback, and import-safety coverage for prebuilt indexes.
 - `pyproject.toml`: canonical runtime and test dependencies; `requirements.txt` installs the editable project and repeats the explicit DRFP pin.
 - `Retrosynthesis_Agent.ipynb`: the Colab dependency/model setup and `launch_workbench()` entry points only.
 

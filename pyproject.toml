@@ -30,7 +30,7 @@ dependencies = [
     "markdown",
     "ord-schema>=0.9.6,<0.10",
     "huggingface_hub",
-    "duckdb",
+    "duckdb>=1.5.6,<1.6",
     # Published ORD wheels require protobuf <6. Allow 6.x as soon as ORD does.
     "protobuf>=5.29.6,<7",
     "numpy",
