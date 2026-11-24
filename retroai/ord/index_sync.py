@@ -116,9 +116,13 @@ def validate_index_manifest(manifest: dict) -> dict:
     if (
         not isinstance(filename, str)
         or not filename.endswith(".duckdb")
+        or "\\" in filename
         or Path(filename).name != filename
     ):
         raise IndexSyncError("Prebuilt index manifest contains an unsafe CbyD filename.")
+    release = cbyd.get("release")
+    if not isinstance(release, str) or not release.strip():
+        raise IndexSyncError("Prebuilt index manifest has no CbyD release tag.")
     checksum = cbyd.get("sha256")
     if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum.lower()):
         raise IndexSyncError("Prebuilt index manifest contains an invalid CbyD sha256.")
@@ -128,6 +132,12 @@ def validate_index_manifest(manifest: dict) -> dict:
         raise IndexSyncError("Prebuilt index manifest contains an invalid CbyD row count.") from exc
     if rows <= 0:
         raise IndexSyncError("Prebuilt CbyD index is unexpectedly empty.")
+    if not isinstance(cbyd.get("license"), str) or not cbyd["license"].strip():
+        raise IndexSyncError("Prebuilt index manifest has no CbyD license.")
+    if not isinstance(cbyd.get("duckdb_version"), str) or not re.match(
+        r"^\d+\.\d+", cbyd["duckdb_version"]
+    ):
+        raise IndexSyncError("Prebuilt index manifest has no valid DuckDB version.")
     normalized = dict(manifest)
     normalized["index_schema_version"] = published_version
     normalized["cbyd"] = {**cbyd, "sha256": checksum.lower(), "rows": rows}
@@ -197,7 +207,7 @@ def _validate_prebuilt_index(path: Path, manifest: dict) -> None:
             f"Prebuilt CbyD database cannot be opened read-only: {exc}. "
             "Confirm that RetroAI's pinned DuckDB version is installed."
         ) from exc
-    if int(metadata.get("index_schema_version", -1)) != INDEX_SCHEMA_VERSION:
+    if metadata.get("index_schema_version") != str(INDEX_SCHEMA_VERSION):
         raise IndexSchemaMismatch(
             "Prebuilt CbyD database metadata does not match RetroAI's index schema "
             f"{INDEX_SCHEMA_VERSION}."
@@ -243,7 +253,10 @@ def _download_prebuilt_index(
             raise IndexSyncError(
                 f"Prebuilt CbyD download is unavailable{detail} at {url}: {exc}"
             ) from exc
-        total = int(response.headers.get("content-length") or 0)
+        try:
+            total = int(response.headers.get("content-length") or 0)
+        except (TypeError, ValueError):
+            total = 0
         progress_bar = nullcontext(None)
         if progress:
             try:
@@ -364,6 +377,10 @@ def sync_prebuilt_cbyd_index(
         if index_path is not None
         else db_path.parent / asset["file"]
     )
+    if target.resolve() == db_path.resolve():
+        raise IndexSyncError(
+            "The prebuilt index cache path must be separate from the shared ORD database."
+        )
     downloaded = _download_prebuilt_index(
         f"{base_url.rstrip('/')}/{quote(asset['file'])}",
         target,
@@ -401,5 +418,5 @@ def try_sync_prebuilt_cbyd_index(
     """Best-effort notebook sync that preserves ORD-only operation on failure."""
     try:
         return sync_prebuilt_cbyd_index(db_path, **kwargs)
-    except (IndexSyncError, OSError, duckdb.Error) as exc:
+    except (IndexSyncError, OSError, TypeError, ValueError, duckdb.Error) as exc:
         return {"status": "unavailable", "error": str(exc)}
